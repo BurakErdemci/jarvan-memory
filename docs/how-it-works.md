@@ -23,6 +23,7 @@ of the vault in front of the agent at the right moment and hold a few gates.
 | `<vault>/` | The notes. See the layout table in `AGENT.md`. |
 | `<claude config>/jarvan-memory/runtime/` | A copy of the Python package and `run.py` |
 | `<claude config>/jarvan-memory/hook.sh` | Shim every hook calls; holds the interpreter path |
+| `<claude config>/jarvan-memory/state/hook-errors.log` | One line per failed hook run; shown at the next session start and by `mem doctor` |
 | `<claude config>/jarvan-memory/bin/mem`, `mem.cmd` | CLI launchers (sh, and cmd/PowerShell) |
 | `<claude config>/jarvan-memory/config.json` | Vault path, interpreter, modules, models, install record |
 | `<claude config>/jarvan-memory/state/` | Per-session counters, scratch notes, search index, job errors. Never in the vault, never synced. |
@@ -35,18 +36,27 @@ of the vault in front of the agent at the right moment and hold a few gates.
 |---|---|---|
 | SessionStart | all | Injects the context block; prunes state older than 7 days; schedules the weekly sweep if enabled |
 | UserPromptSubmit | all | Counts prompts (the stop gate reads the count); suggests up to 2 note sections when the gate passes |
-| PreToolUse | `Write\|Bash` | Refuses hand-written worklog files and shell appends that type a timestamp into the worklog |
+| PreToolUse | `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash` | Refuses writes to the worklog folder by the file tools, and shell writes into it that type a timestamp |
 | PostToolUse | `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash` | Marks "this session wrote to memory" |
 | PostToolUseFailure | `Bash` | Recalls at most 2 notes that match the failure, once per note per session |
 | Stop | all | The stop gate |
 | SessionEnd | all | Writes a clock-stamped session line; updates the miss streak; starts optional jobs detached |
 
-Every hook command is `bash "<claude config>/jarvan-memory/hook.sh" <event>`.
+Every hook command is `bash '<claude config>/jarvan-memory/hook.sh' <event>`;
+paths in the command, the shim and the `mem` launcher are single-quoted with
+POSIX escaping, so a home folder with a space, `'`, `$` or a backtick works.
 Claude Code runs hooks through Git Bash on Windows and `sh`/`bash` elsewhere,
-so the same command works on all three systems. The shim exits at once inside
-any child process we start (`JARVAN_MEMORY_CHILD=1`), and if the recorded
-interpreter is gone it says so in the session-start block instead of failing
-silently.
+so the same command works on all three systems. The shim is plain POSIX `sh`
+and **always exits 0**: a non-zero exit from a hook makes Claude Code block
+tool calls or the end of a turn, which a broken memory must never do. It exits
+at once inside any child process we start (`JARVAN_MEMORY_CHILD=1`). If the
+recorded interpreter or the runtime file is gone, or Python exits non-zero,
+it appends a line to `state/hook-errors.log` and, at session start, says so in
+the session-start block instead of failing silently.
+
+Failures inside the Python handlers are logged the same way. The next session
+start shows how many log lines are new since the last one (and the last
+line); `mem doctor` shows a WARN for errors of the last 7 days.
 
 ## Read path
 
@@ -75,7 +85,7 @@ never written.
 Each section is indexed with its heading chain, its line range and its text,
 folded (lowercase, diacritics removed) so search works across Latin-script
 languages. A note's INDEX trigger text is indexed with its first section at
-high weight. Ranking is BM25 with weights path 2, heading 6, body 1, stems 1,
+high weight, and its words count as matched words for the suggestion gate. Ranking is BM25 with weights path 2, heading 6, body 1, stems 1,
 triggers 4, then multiplied down for refuted (0.3), superseded (0.3),
 promoted (0.5, the permanent note should win), unverified (0.8), archived or
 handoff notes (0.8), and a slow age decay (never below 0.75). At most two
@@ -83,10 +93,18 @@ sections per note. Output: `path:start-end  heading  [status]` and up to three
 best lines. The index updates incrementally by file mtime and size. Without
 FTS5, a pure-Python scan gives the same output.
 
-**Prompt suggestions** use the same search with a strict gate: at least two
-content words; the best section must contain at least three of them *and* at
-least 60% of all of them. Otherwise the hook prints nothing, so a large vault
-costs a prompt no more than a small one. A note is suggested once per session.
+**Prompt suggestions** use the same search with a strict gate: at least three
+content words; the best section (heading, body and its INDEX trigger text) must
+contain at least three of them *and* at least 60% of all of them. Otherwise
+the hook prints nothing, so a large vault costs a prompt no more than a small
+one. A note is suggested once per session.
+
+**Large vaults.** `install.py` builds the search index. A hook never spends
+more than about 3 seconds indexing (`search.HOOK_INDEX_BUDGET`): if the index
+is missing or stale beyond that, it indexes what fits, stays silent for that
+prompt and carries on at the next call. `mem search` always indexes fully.
+Line numbers count only `\n` as a line break (not U+2028 or form feed), like an
+editor and the Read tool.
 
 **Failure recall** looks at a failed Bash call's error lines. It tries several
 views (the whole error, the last line, each error line on its own) because a
@@ -96,9 +114,17 @@ refuted one, once per note per session.
 
 ## Write path
 
+All writers share one vault lock (`state/vault.lock`, waited for up to 30
+seconds; a timeout is an error, never a silent skip) and write through a temp
+file plus `os.replace`, so parallel `mem` calls never lose a line. Every name
+or path typed into a command must stay inside the vault folder it is meant for:
+absolute paths, drive letters, `..`, separators in slugs, characters invalid on
+Windows and system folder names (any letter case) are refused with a message.
+
 - `mem log` — one worklog line: `- <stamp> · agent · <project> · <text>[ · next: …] · done|handoff: [[…]]`.
   The carry-over declaration (`--done` or `--handoff <slug>`) is required; the
-  line is at most 200 characters; typed timestamps are refused.
+  line is at most 200 characters; typed timestamps are refused in the text,
+  `--next` and `--project`.
 - `mem handoff open|close|list` — five-section notes; the open list is derived
   from each note's `status` on every call; closing archives, never deletes.
 - `mem infer observation|claim`, `verify`, `promote`, `refute` — the quarantine (below).
@@ -123,8 +149,10 @@ claim ──► unverified ──verify (fresh evidence)──► verified ─�
   `person` (only the user may confirm: `--user-confirmed`).
 - `verify` needs evidence text of at least 20 characters describing what was
   re-measured; promotion needs a verification younger than 14 days.
-- `promote --to note#section` refuses unless the note and the heading exist:
-  write the knowledge first, then stamp the record.
+- `promote --to note#section` refuses unless the note and the heading exist
+  (a section is at least 2 characters), and refuses a target in a system
+  folder, the quarantine folder included: write the knowledge first, then stamp
+  the record.
 - A promoted record cannot be refuted until its permanent note is fixed.
 
 ## Gates
@@ -140,13 +168,20 @@ never blocked, so the gate cannot loop; the block is recorded only after the
 reply was printed. The gate re-arms after another full stretch.
 
 A "memory write" is a Write/Edit inside the vault, or a Bash command that
-mentions the vault path or runs a writing `mem` subcommand. `mem search` does
-not count.
+writes there (a `>`/`>>` redirect, `tee`, the target of `cp`, `mv` or `rm`,
+`sed -i`) or runs a writing `mem` subcommand. Reading (`cat`, `grep`) and
+`mem search` do not count. On Windows `/c/...` and `C:\...` name the same file.
 
-**Worklog guard.** `Write` to a worklog file is refused. A Bash command that
-writes (`>>`, `>`, `tee`, `sed -i`, ...) into a worklog path *and* contains a
-`YYYY-MM-DD HH:MM` timestamp is refused. `Edit` stays allowed, so a single
-wrong line can still be corrected deliberately.
+**Worklog guard.** Write, Edit, MultiEdit and NotebookEdit on a file inside
+`<vault>/worklog/` are refused (a relative path is tested against the payload
+`cwd` and against the vault root). A Bash command is refused when it types a
+`YYYY-MM-DD HH:MM` timestamp *and* one of its write targets (a redirect, `tee`,
+the destination of `cp`/`mv`, a `sed -i` file) resolves inside
+`<vault>/worklog/`; relative targets are resolved against the payload `cwd`,
+following a leading `cd X &&`. Commands that only mention a worklog path, or
+write to a `worklog` folder of another project, are not touched. Limit:
+interpreter one-liners (`python -c "open(...).write(...)"`) are not parsed, so
+they are not guarded. A wrong old line is for the user to fix by hand.
 
 ## Optional modules
 
@@ -158,8 +193,9 @@ on success. Session start shows recorded failures.
 - **summary** — SessionEnd: transcript text (user and assistant text only) →
   skip under 2000 characters → newest 120 000 characters → `claude -p
   --setting-sources "" --tools "" --no-session-persistence` with the
-  transcript fenced as untrusted data and the output contract repeated after
-  it → the reply must have exactly six headings in order (or the single
+  transcript fenced as untrusted data (begin/end markers carry a random
+  per-call nonce, so transcript text cannot close the fence; the sweep prompt
+  does the same) and the output contract repeated after it → the reply must have exactly six headings in order (or the single
   word `NOTHING_TO_KEEP`) → appended to `daily/YYYY-MM-DD.md`. A per-session
   lock prevents duplicates; timeouts kill the whole process tree.
 - **backup** — after the summary: `git add -A`, commit if anything changed,
@@ -185,4 +221,5 @@ hooks fire (session-start injects a block; others answer) · stop gate armed
 (a probe Write to the worklog gets `deny`) · mem command runs · vault writable
 · vault skeleton · no leftover placeholders · CLAUDE.md pointer · search works
 (a throwaway vault with a known note must return that note at the right
-line) · plus `claude` CLI and git when the modules that need them are on.
+line) · plus `claude` CLI and git when the modules that need them are on. A WARN
+line lists hook errors of the last 7 days from `state/hook-errors.log`.

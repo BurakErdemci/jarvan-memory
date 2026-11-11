@@ -11,11 +11,13 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 from . import util, vault as V
 
 PROBE = "jm-doctor-probe"
+HOOK_ERROR_DAYS = 7
 
 
 class Report:
@@ -148,6 +150,10 @@ def run_checks():
     errs = _read_json(util.state_dir() / "job-errors.json")
     for k, v in errs.items():
         rep.warn(f"last {k} job", v)
+    recent = _recent_hook_errors()
+    if recent:
+        rep.warn("recent hook errors", f"{len(recent)} in the last {HOOK_ERROR_DAYS} days; "
+                 f"last: {recent[-1]} (log: {util.fwd(util.state_dir() / 'hook-errors.log')})")
     hb = _read_json(util.state_dir() / "heartbeat.json")
     rep.info("last real hook runs", ", ".join(f"{k} {v}" for k, v in sorted(hb.items()))
              or "none yet: hooks fire from the next Claude Code session (restart it)")
@@ -256,6 +262,19 @@ def _search_check(cfg):
         return ("search works", False, f"vault index: {type(e).__name__}: {e}")
     return ("search works", ok, f"known-answer probe ok; vault index has {n} sections"
             if ok else "known-answer probe did not return the probe note at line 5")
+
+
+def _recent_hook_errors():
+    """Lines of state/hook-errors.log from the last HOOK_ERROR_DAYS days.
+    Hooks swallow their own failures so a bug never breaks a session; this is
+    where they surface."""
+    p = util.state_dir() / "hook-errors.log"
+    try:
+        lines = util.read_text(p).splitlines()
+    except OSError:
+        return []
+    since = util.stamp(util.now() - timedelta(days=HOOK_ERROR_DAYS))
+    return [l for l in lines if l.strip() and l[:16] >= since]
 
 
 def _read_json(p):

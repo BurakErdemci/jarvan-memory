@@ -1,7 +1,6 @@
 """Gate promises, driven through the registered hook commands: the stop gate
 blocks a long session with no memory write, re-arms, never loops; the
 worklog guard refuses hand-typed timestamps."""
-import json
 import unittest
 import uuid
 
@@ -86,13 +85,21 @@ class WorklogGuardTest(HomeTest):
         self.assertEqual(self.pre("Write", {"file_path": str(self.h.vault / "worklog" / "2026-01.md"),
                                             "content": "x"}), "deny")
 
-    def test_mem_log_and_edits_are_allowed(self):
+    def test_mem_log_and_other_notes_are_allowed(self):
         mem = '"' + str(self.h.app / "bin" / "mem").replace("\\", "/") + '"'
         self.assertIsNone(self.pre("Bash", {"command": f'{mem} log "built it" --done'}))
-        self.assertIsNone(self.pre("Edit", {"file_path": str(self.h.vault / "worklog" / "2026-01.md"),
-                                            "old_string": "a", "new_string": "b"}))
         self.assertIsNone(self.pre("Write", {"file_path": str(self.h.vault / "topics" / "A.md"),
                                              "content": "2026-01-05 10:00 measured"}))
+        self.assertIsNone(self.pre("Edit", {"file_path": str(self.h.vault / "topics" / "A.md"),
+                                            "old_string": "a", "new_string": "b"}))
+
+    def test_edit_tools_on_the_worklog_are_denied_too(self):
+        wl = str(self.h.vault / "worklog" / "2026-01.md")
+        for tool in ("Edit", "MultiEdit"):
+            self.assertEqual(self.pre(tool, {"file_path": wl, "old_string": "a",
+                                             "new_string": "- 2026-01-05 10:00 \u00b7 x"}),
+                             "deny", tool)
+        self.assertEqual(self.pre("NotebookEdit", {"notebook_path": wl}), "deny")
 
     def test_mem_log_refuses_typed_timestamp(self):
         r = self.h.mem("log", "2026-01-05 10:00 shipped", "--done")

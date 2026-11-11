@@ -52,9 +52,9 @@ def _tmp_root():
 
 
 class FakeHome:
-    def __init__(self):
+    def __init__(self, home_name="home"):
         self.root = _tmp_root()
-        self.home = self.root / "home"
+        self.home = self.root / home_name
         self.home.mkdir()
         self.claude = self.home / ".claude"
         self.vault = self.home / "vault"
@@ -90,7 +90,7 @@ class FakeHome:
 
     def mem(self, *args, cwd=None):
         """Run the generated launcher through bash, as the agent would."""
-        cmd = '"' + str(self.app / "bin" / "mem").replace("\\", "/") + '"'
+        cmd = _q(str(self.app / "bin" / "mem").replace("\\", "/"))
         line = " ".join([cmd] + [_q(a) for a in args])
         return subprocess.run([BASH, "-c", line], env=self.env, capture_output=True,
                               text=True, encoding="utf-8", cwd=str(cwd or self.work))
@@ -103,6 +103,12 @@ class FakeHome:
                     if "jarvan-memory/hook.sh" in h["command"] and h["command"].endswith(" " + name):
                         return h["command"]
         raise AssertionError(f"hook {name} not registered")
+
+    def hook_raw(self, name, payload):
+        """The exact registered command, whatever it answers (exit code included)."""
+        payload = dict({"session_id": "s1", "cwd": str(self.work)}, **payload)
+        return subprocess.run([BASH, "-c", self.hook_command(name)], env=self.env,
+                              input=json.dumps(payload).encode("utf-8"), capture_output=True)
 
     def hook(self, name, payload):
         """Run the exact registered command string, as Claude Code does."""

@@ -92,6 +92,31 @@ class MemTest(HomeTest):
         idx = (self.h.vault / "INDEX.md").read_text(encoding="utf-8")
         self.assertIn("- [[projects/Atlas]] — atlas service / map tiles", idx)
 
+    def test_a_stale_verification_cannot_be_promoted(self):
+        self.ok("infer", "claim", "Stale claim here", "--scope", "project", "--force")
+        self.ok("verify", "stale-claim-here", "--evidence",
+                "re-ran the benchmark three times, same numbers each time")
+        self.ok("note", "new", "topics", "Stalenote", "--force")
+        note = self.h.vault / "topics" / "Stalenote.md"
+        note.write_text(note.read_text(encoding="utf-8") + "\n## Section\n\nbody\n",
+                        encoding="utf-8")
+        rec = self.h.vault / "inferences" / "stale-claim-here.md"
+        rec.write_text(re.sub(r"verified: [\d\- :]+", "verified: 2020-01-01 10:00",
+                              rec.read_text(encoding="utf-8"), count=1), encoding="utf-8")
+        self.assertIn("old", self.fail("promote", "stale-claim-here", "--to",
+                                       "topics/Stalenote#Section"))
+
+    def test_a_promoted_record_cannot_be_refuted(self):
+        self.ok("infer", "claim", "Promoted claim here", "--scope", "project", "--force")
+        self.ok("verify", "promoted-claim-here", "--evidence",
+                "re-ran the benchmark three times, same numbers each time")
+        self.ok("note", "new", "topics", "Promonote", "--force")
+        note = self.h.vault / "topics" / "Promonote.md"
+        note.write_text(note.read_text(encoding="utf-8") + "\n## Section\n\nbody\n",
+                        encoding="utf-8")
+        self.ok("promote", "promoted-claim-here", "--to", "topics/Promonote#Section")
+        self.assertIn("promoted", self.fail("refute", "promoted-claim-here", "--reason", "no"))
+
     def test_system_folders_are_not_note_folders(self):
         self.assertIn("not a note folder", self.fail("note", "new", "worklog", "Mine"))
 

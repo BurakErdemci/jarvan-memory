@@ -35,6 +35,8 @@ SKELETON_FILES = [CONTRACT, INDEX, PROFILE]
 LINE_BUDGET = 200
 # A verification older than this is not "fresh" for promotion.
 VERIFY_FRESH_DAYS = 14
+# A promotion's `#section` must name a heading, not a letter that matches any.
+MIN_SECTION_CHARS = 2
 # Priority marker inside an INDEX line; session start shows these lines.
 PRIORITY_TOKEN = "READ FIRST"
 MAX_PRIORITY_LINES = 4
@@ -50,6 +52,12 @@ HANDOFF_HEADINGS = [
 TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
 WORKLOG_LINE_RE = re.compile(
     r"^- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) · (agent|session) · ([^·]+?) · (.*)$")
+
+
+WIN_BAD_CHARS = '<>:"|?*'
+WIN_DEVICE_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                    *(f"lpt{i}" for i in range(1, 10))}
+RESERVED_DIRS = {d.lower() for d in SYSTEM_DIRS}
 
 
 class MemError(Exception):
@@ -89,6 +97,47 @@ def current_project(cwd=None):
     return Path(cwd).name or "general"
 
 
+def check_name(value, what):
+    """A single path component typed by the user (slug, file name). It names
+    something inside one known folder, so it can never carry a separator."""
+    v = (value or "").strip()
+    if not v or v in (".", "..") or "/" in v or "\\" in v:
+        raise MemError(f"{what} '{value}' must be a plain name, not a path "
+                       "(no separators, no '..').")
+    bad = [c for c in v if c in WIN_BAD_CHARS or ord(c) < 32]
+    if bad:
+        raise MemError(f"{what} '{value}' has characters that are invalid in a file name "
+                       f"({' '.join(sorted(set(bad)))}).")
+    if v.endswith((".", " ")) or v.split(".")[0].lower() in WIN_DEVICE_NAMES:
+        raise MemError(f"{what} '{value}' is not a valid file name on Windows.")
+    return v
+
+
+def check_rel_path(value, what):
+    """A vault-relative path typed by the user -> its parts. Absolute paths,
+    drive letters, '..' and characters invalid on Windows are refused: the
+    command would otherwise touch files outside the vault."""
+    raw = (value or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        raise MemError(f"{what} '{value}' must be a path inside the vault, "
+                       "not an absolute path or a drive.")
+    parts = raw.rstrip("/").split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise MemError(f"{what} '{value}' must not contain '..' or empty parts.")
+    for p in parts:
+        check_name(p, what)
+    return parts
+
+
+def inside(path, folder):
+    """True when `path` resolves to a location inside `folder`."""
+    try:
+        Path(path).resolve().relative_to(Path(folder).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _check_no_timestamp(text, what):
     if TS_RE.search(text or ""):
         raise MemError(
@@ -126,9 +175,10 @@ def _ensure_worklog(path):
 
 def append_worklog(kind, project, body):
     path = worklog_file()
-    with util.FileLock(util.state_dir() / "worklog.lock"):
+    project = " ".join(str(project or "").split()) or "general"
+    with util.vault_lock():
         _ensure_worklog(path)
-        line = f"- {util.stamp()} · {kind} · {project.strip() or 'general'} · {body}\n"
+        line = f"- {util.stamp()} · {kind} · {project} · {body}\n"
         util.append_text(path, line)
     return line.rstrip("\n")
 
@@ -144,7 +194,13 @@ def log(text, next_step=None, handoff=None, done=False, project=None):
         raise MemError(
             "say whether work is carried over: pass --handoff <slug> (open a handoff "
             "first with `mem handoff open`) or --done (nothing left open).")
+    project = " ".join((project or "").split())
+    with util.vault_lock():
+        # The month's file exists before any line is judged, so a refused line
+        # and an accepted one leave the vault in the same shape.
+        _ensure_worklog(worklog_file())
     _check_no_timestamp(text + " " + next_step, "worklog text")
+    _check_no_timestamp(project, "--project")
     body = text + (f" · next: {next_step}" if next_step else "")
     if len(body) > LINE_BUDGET:
         raise MemError(
@@ -152,6 +208,7 @@ def log(text, next_step=None, handoff=None, done=False, project=None):
             "A worklog line is a pointer: put the detail in a handoff note or a topic "
             "note and keep the line short.")
     if handoff:
+        handoff = check_name(handoff, "handoff slug")
         if not find_handoff(handoff, include_closed=True):
             raise MemError(f"no handoff named '{handoff}'. Open it first: "
                            f"mem handoff open \"<title>\" --slug {handoff}")
@@ -180,6 +237,7 @@ def read_worklog(limit_months=3):
 # ----------------------------------------------------------------- handoffs
 
 def find_handoff(slug, include_closed=False):
+    slug = check_name(slug, "handoff slug")
     p = vault() / HANDOFFS / f"{slug}.md"
     if p.exists():
         return p
@@ -193,28 +251,30 @@ def find_handoff(slug, include_closed=False):
 def handoff_open(title, slug=None, project=None):
     _check_no_timestamp(title, "title")
     slug = util.slugify(slug or title)
-    if find_handoff(slug, include_closed=True):
-        raise MemError(f"handoff '{slug}' already exists; pick another --slug")
-    meta = {"title": title, "project": project or current_project(),
-            "status": "open", "created": util.stamp(), "updated": util.stamp(),
-            "source": "claude-code"}
-    body = f"# {title}\n\n" + "".join(f"## {h}\n\n\n" for h in HANDOFF_HEADINGS)
-    path = vault() / HANDOFFS / f"{slug}.md"
-    util.write_text(path, util.render_frontmatter(meta) + body)
+    with util.vault_lock():
+        if find_handoff(slug, include_closed=True):
+            raise MemError(f"handoff '{slug}' already exists; pick another --slug")
+        meta = {"title": title, "project": project or current_project(),
+                "status": "open", "created": util.stamp(), "updated": util.stamp(),
+                "source": "claude-code"}
+        body = f"# {title}\n\n" + "".join(f"## {h}\n\n\n" for h in HANDOFF_HEADINGS)
+        path = vault() / HANDOFFS / f"{slug}.md"
+        util.write_text(path, util.render_frontmatter(meta) + body)
     return path
 
 
 def handoff_close(slug):
-    path = find_handoff(slug)
-    if not path:
-        raise MemError(f"no open handoff named '{slug}'")
-    util.update_frontmatter(path, status="closed", closed=util.stamp(),
-                            updated=util.stamp())
-    # Closed handoffs are archived, never deleted: "tried X, it failed" keeps
-    # the next session from trying X again.
-    dest = vault() / ARCHIVE / HANDOFFS / path.name
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(path, dest)
+    with util.vault_lock():
+        path = find_handoff(slug)
+        if not path:
+            raise MemError(f"no open handoff named '{slug}'")
+        # Closed handoffs are archived, never deleted: "tried X, it failed" keeps
+        # the next session from trying X again.
+        dest = vault() / ARCHIVE / HANDOFFS / path.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        util.update_frontmatter(path, status="closed", closed=util.stamp(),
+                                updated=util.stamp())
+        os.replace(path, dest)
     return dest
 
 
@@ -240,7 +300,7 @@ STATUSES = ("observation", "unverified", "verified", "promoted", "refuted")
 
 
 def inference_path(slug):
-    return vault() / INFERENCES / f"{slug}.md"
+    return vault() / INFERENCES / f"{check_name(slug, 'record name')}.md"
 
 
 def _load_inference(slug):
@@ -262,59 +322,70 @@ def infer(kind, title, scope=None, slug=None, text=None, related=None, force=Fal
                        "promote it after fresh verification) or --scope person (about "
                        "the user; only the user may confirm it).")
     slug = util.slugify(slug or title)
-    p = inference_path(slug)
-    if p.exists():
-        raise MemError(f"record '{slug}' exists; add to it instead of duplicating")
-    if not force:
-        hit = similar_name(slug, vault() / INFERENCES)
-        if hit:
-            raise DuplicateError(f"a similar record exists: {rel(hit)}. Read it and add "
-                                 "to it, or pass --force if it is really different.")
-    meta = {"title": title, "kind": kind,
-            "status": "observation" if kind == "observation" else "unverified",
-            "scope": scope or "-", "created": util.stamp(), "updated": util.stamp(),
-            "source": "claude-code"}
-    if kind == "observation":
-        body = f"# {title}\n\n## Observation\n\n{text or ''}\n\n"
-    else:
-        body = (f"# {title}\n\n## Claim\n\n{text or ''}\n\n## Evidence\n\n\n"
-                "## Not tested\n\n\n")
-    body += f"Related: [[{related}]]\n" if related else "Related: \n"
-    util.write_text(p, util.render_frontmatter(meta) + body)
+    with util.vault_lock():
+        p = inference_path(slug)
+        if p.exists():
+            raise MemError(f"record '{slug}' exists; add to it instead of duplicating")
+        if not force:
+            hit = similar_name(slug, vault() / INFERENCES)
+            if hit:
+                raise DuplicateError(f"a similar record exists: {rel(hit)}. Read it and add "
+                                     "to it, or pass --force if it is really different.")
+        meta = {"title": title, "kind": kind,
+                "status": "observation" if kind == "observation" else "unverified",
+                "scope": scope or "-", "created": util.stamp(), "updated": util.stamp(),
+                "source": "claude-code"}
+        if kind == "observation":
+            body = f"# {title}\n\n## Observation\n\n{text or ''}\n\n"
+        else:
+            body = (f"# {title}\n\n## Claim\n\n{text or ''}\n\n## Evidence\n\n\n"
+                    "## Not tested\n\n\n")
+        body += f"Related: [[{related}]]\n" if related else "Related: \n"
+        util.write_text(p, util.render_frontmatter(meta) + body)
     return p
 
 
-def _append_section(path, heading, text):
-    content = util.read_text(path).rstrip("\n")
-    util.write_text(path, content + f"\n\n## {heading} ({util.stamp()})\n\n{text}\n")
+def _advance(path, heading, text, **changes):
+    """Append a dated section and change the frontmatter in ONE write, so a
+    crash never leaves a section whose status was not updated."""
+    meta, body = util.parse_frontmatter(util.read_text(path))
+    meta.update({k: v for k, v in changes.items() if v is not None})
+    body = body.rstrip("\n") + f"\n\n## {heading} ({util.stamp()})\n\n{text}\n"
+    util.write_text(path, util.render_frontmatter(meta) + body)
 
 
 def verify(slug, evidence):
-    p, meta, _ = _load_inference(slug)
-    st = meta.get("status")
-    if st != "unverified":
-        raise MemError(f"'{slug}' is {st}; only an unverified claim can be verified")
-    evidence = " ".join((evidence or "").split())
-    if len(evidence) < 20:
-        raise MemError("--evidence must say what you re-measured and how (at least "
-                       "20 characters). Re-reading the same notes is not verification.")
-    _append_section(p, "Verification", evidence)
-    util.update_frontmatter(p, status="verified", verified=util.stamp(),
-                            updated=util.stamp())
+    with util.vault_lock():
+        p, meta, _ = _load_inference(slug)
+        st = meta.get("status")
+        if st != "unverified":
+            raise MemError(f"'{slug}' is {st}; only an unverified claim can be verified")
+        evidence = " ".join((evidence or "").split())
+        if len(evidence) < 20:
+            raise MemError("--evidence must say what you re-measured and how (at least "
+                           "20 characters). Re-reading the same notes is not verification.")
+        _advance(p, "Verification", evidence, status="verified", verified=util.stamp(),
+                 updated=util.stamp())
     return p
 
 
 def resolve_note(target):
-    """`topics/x`, `topics/x.md` or a unique basename -> Path or None."""
-    target = target.strip()
+    """`topics/x`, `topics/x.md` or a unique basename -> Path or None. The
+    target stays inside the vault and outside the system folders (the
+    quarantine folder included: a record cannot be its own permanent home)."""
+    parts = check_rel_path(target, "target note")
+    if parts[0].lower() in RESERVED_DIRS:
+        raise MemError(f"'{target}' is in a system folder ({parts[0]}/), not a permanent "
+                       "note. Promote into a topic, project or profile note.")
+    target = "/".join(parts)
     root = vault()
     for cand in (root / target, root / f"{target}.md"):
-        if cand.is_file():
+        if cand.is_file() and inside(cand, root):
             return cand
-    name = Path(target).name
+    name = parts[-1]
     name = name if name.endswith(".md") else f"{name}.md"
     hits = [p for p in iter_notes(root) if p.name == name
-            and INFERENCES not in p.relative_to(root).parts]
+            and p.relative_to(root).parts[0].lower() not in RESERVED_DIRS]
     if len(hits) > 1:
         raise MemError(f"'{target}' is ambiguous: " + ", ".join(rel(h) for h in hits))
     return hits[0] if hits else None
@@ -330,55 +401,61 @@ def has_heading(path, section):
 
 
 def promote(slug, target, user_confirmed=False):
-    p, meta, _ = _load_inference(slug)
-    st = meta.get("status")
-    if st != "verified":
-        raise MemError(f"'{slug}' is {st}. Promotion needs a fresh verification first: "
-                       f"mem verify {slug} --evidence \"what you re-measured, how\"")
-    try:
-        age = (util.now() - util.datetime.strptime(meta.get("verified", ""),
-                                                   "%Y-%m-%d %H:%M")).days
-    except ValueError:
-        age = 10 ** 6
-    if age > VERIFY_FRESH_DAYS:
-        raise MemError(f"the verification is {age} days old (limit {VERIFY_FRESH_DAYS}); "
-                       "re-verify before promoting")
-    if meta.get("scope") == "person" and not user_confirmed:
-        raise MemError("this claim is about the user (scope: person); only the user may "
-                       "confirm it. Ask them, then pass --user-confirmed.")
-    note, _, section = target.partition("#")
-    path = resolve_note(note)
-    # The gate: the promoted knowledge must already live somewhere. Without it
-    # a record can point at a section that was never written.
-    if not path:
-        raise MemError(f"target note '{note}' does not exist. Write the knowledge "
-                       "into the permanent note first, then promote.")
-    if section and not has_heading(path, section):
-        raise MemError(f"'{rel(path)}' has no heading matching '{section}'. Write that "
-                       "section first, then promote.")
-    dest = rel(path) + (f"#{section}" if section else "")
-    _append_section(p, "Promoted", f"Now lives in [[{dest}]]. This record only shows "
-                    "where the knowledge came from; rely on the permanent note.")
-    util.update_frontmatter(p, status="promoted", promoted_to=dest, promoted=util.stamp(),
-                            updated=util.stamp())
+    with util.vault_lock():
+        p, meta, _ = _load_inference(slug)
+        st = meta.get("status")
+        if st != "verified":
+            raise MemError(f"'{slug}' is {st}. Promotion needs a fresh verification first: "
+                           f"mem verify {slug} --evidence \"what you re-measured, how\"")
+        try:
+            age = (util.now() - util.datetime.strptime(meta.get("verified", ""),
+                                                       "%Y-%m-%d %H:%M")).days
+        except ValueError:
+            age = 10 ** 6
+        if age > VERIFY_FRESH_DAYS:
+            raise MemError(f"the verification is {age} days old (limit {VERIFY_FRESH_DAYS}); "
+                           "re-verify before promoting")
+        if meta.get("scope") == "person" and not user_confirmed:
+            raise MemError("this claim is about the user (scope: person); only the user may "
+                           "confirm it. Ask them, then pass --user-confirmed.")
+        note, hashed, section = target.partition("#")
+        section = section.strip()
+        if hashed and len(section) < MIN_SECTION_CHARS:
+            raise MemError(f"the section after '#' must be at least {MIN_SECTION_CHARS} "
+                           "characters of a heading in the target note.")
+        path = resolve_note(note)
+        # The gate: the promoted knowledge must already live somewhere. Without it
+        # a record can point at a section that was never written.
+        if not path:
+            raise MemError(f"target note '{note}' does not exist. Write the knowledge "
+                           "into the permanent note first, then promote.")
+        if section and not has_heading(path, section):
+            raise MemError(f"'{rel(path)}' has no heading matching '{section}'. Write that "
+                           "section first, then promote.")
+        dest = rel(path) + (f"#{section}" if section else "")
+        _advance(p, "Promoted", f"Now lives in [[{dest}]]. This record only shows "
+                 "where the knowledge came from; rely on the permanent note.",
+                 status="promoted", promoted_to=dest, promoted=util.stamp(),
+                 updated=util.stamp())
     return p, dest
 
 
 def refute(slug, reason):
-    p, meta, _ = _load_inference(slug)
-    st = meta.get("status")
-    if st in ("refuted",):
-        raise MemError(f"'{slug}' is already refuted")
-    if st == "promoted":
-        raise MemError(f"'{slug}' is promoted; fix the permanent note "
-                       f"({meta.get('promoted_to')}) first, then refute")
-    reason = " ".join((reason or "").split())
-    if not reason:
-        raise MemError("--reason is required")
-    # Refuted records are kept: they are what stops the same wrong inference
-    # from being made again.
-    _append_section(p, "Refuted", reason)
-    util.update_frontmatter(p, status="refuted", refuted=util.stamp(), updated=util.stamp())
+    with util.vault_lock():
+        p, meta, _ = _load_inference(slug)
+        st = meta.get("status")
+        if st in ("refuted",):
+            raise MemError(f"'{slug}' is already refuted")
+        if st == "promoted":
+            raise MemError(f"'{slug}' is promoted; fix the permanent note "
+                           f"({meta.get('promoted_to')}) first, then refute")
+        reason = " ".join((reason or "").split())
+        if not reason:
+            raise MemError("--reason is required")
+        # Refuted records are kept: they are what stops the same wrong inference
+        # from being made again.
+        _advance(p, "Refuted", reason, status="refuted", refuted=util.stamp(),
+                 updated=util.stamp())
     return p
 
 
@@ -432,38 +509,49 @@ def similar_name(name, scope=None):
 
 
 def note_new(folder, name, title=None, trigger=None, force=False, tags=""):
-    folder = folder.strip("/\\").replace("\\", "/")
-    parts = folder.split("/")
-    if not folder or ".." in parts or parts[0] in SYSTEM_DIRS or len(parts) > 2:
+    try:
+        parts = check_rel_path(folder, "folder")
+    except MemError:
+        parts = []
+    if not parts or len(parts) > 2 or parts[0].lower() in RESERVED_DIRS:
         raise MemError(f"'{folder}' is not a note folder. Use topics, projects, "
-                       "projects/<name>, or another top-level folder you created. "
-                       "System folders are written by their own commands.")
-    if any(c in name for c in "/\\") or name.startswith(".") or not name.strip():
+                       "projects/<name>, or another top-level folder you created, "
+                       "named relative to the vault. System folders are written by "
+                       "their own commands.")
+    name = check_name(name, "note name")
+    if name.startswith("."):
         raise MemError("note name must be a plain file name")
     _check_no_timestamp(title or "", "title")
+    folder = "/".join(parts)
     path = vault() / folder / (name if name.endswith(".md") else f"{name}.md")
-    if path.exists():
-        raise MemError(f"{rel(path)} exists: append to it instead")
-    if not force:
-        hit = similar_name(path.name)
-        if hit:
-            raise DuplicateError(f"a similar note exists: {rel(hit)}. Read it and append "
-                                 "there, or pass --force if it is really a new topic.")
-    title = title or path.stem.replace("_", " ").replace("-", " ")
-    meta = {"title": title, "created": util.stamp(), "updated": util.stamp(),
-            "source": "claude-code", "tags": [t.strip() for t in tags.split(",") if t.strip()]}
-    util.write_text(path, util.render_frontmatter(meta) + f"# {title}\n\n")
-    if trigger:
-        add_index_line(rel(path)[:-3], trigger)
+    if not inside(path, vault() / parts[0]):
+        raise MemError(f"'{folder}/{name}' resolves outside the vault.")
+    with util.vault_lock():
+        if path.exists():
+            raise MemError(f"{rel(path)} exists: append to it instead")
+        if not force:
+            hit = similar_name(path.name)
+            if hit:
+                raise DuplicateError(f"a similar note exists: {rel(hit)}. Read it and append "
+                                     "there, or pass --force if it is really a new topic.")
+        title = title or path.stem.replace("_", " ").replace("-", " ")
+        meta = {"title": title, "created": util.stamp(), "updated": util.stamp(),
+                "source": "claude-code",
+                "tags": [t.strip() for t in tags.split(",") if t.strip()]}
+        util.write_text(path, util.render_frontmatter(meta) + f"# {title}\n\n")
+        if trigger:
+            add_index_line(rel(path)[:-3], trigger)
     return path
 
 
 def add_index_line(link, trigger):
     _check_no_timestamp(trigger, "trigger")
+    link = "/".join(check_rel_path(link.removesuffix(".md"), "index link"))
     idx = vault() / INDEX
     line = f"- [[{link}]] — {' '.join(trigger.split())}\n"
-    text = util.read_text(idx) if idx.exists() else "# Index\n\n"
-    util.write_text(idx, text.rstrip("\n") + "\n" + line)
+    with util.vault_lock():
+        text = util.read_text(idx) if idx.exists() else "# Index\n\n"
+        util.write_text(idx, text.rstrip("\n") + "\n" + line)
     return line.strip()
 
 

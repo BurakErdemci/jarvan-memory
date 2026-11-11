@@ -3,10 +3,13 @@
 Everything here is stdlib only. Paths are resolved from the environment on
 every call so tests (and a fake HOME) can redirect them.
 """
+import contextlib
+import hashlib
 import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 from datetime import datetime
@@ -53,6 +56,15 @@ def config_path():
 def fwd(p):
     """Absolute path with forward slashes: valid in Git Bash, cmd and POSIX."""
     return str(Path(p).resolve()).replace("\\", "/")
+
+
+def safe_sid(sid):
+    """A session id comes from outside and becomes a file name."""
+    sid = str(sid or "")
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", sid)
+    if not clean or clean != sid or len(clean) > 100:
+        return "h" + hashlib.sha256(sid.encode()).hexdigest()[:24] if sid else "nosession"
+    return clean
 
 
 # ----------------------------------------------------------------- config
@@ -131,17 +143,43 @@ def words(text):
 # ----------------------------------------------------------------- files
 
 def read_text(path):
-    return Path(path).read_text(encoding="utf-8", errors="replace")
+    """Windows editors add a UTF-8 BOM; it must not hide a note's frontmatter."""
+    return Path(path).read_text(encoding="utf-8-sig", errors="replace")
 
 
 def write_text(path, text):
     """Atomic write: a crash never leaves a half-written note."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     os.replace(tmp, path)
+
+
+def write_bytes_keep_link(path, data):
+    """Write a file the user may have linked elsewhere (a dotfiles repo).
+    A symlink is written through to its target; a hard link is rewritten in
+    place, because replacing the directory entry would silently break it."""
+    path = Path(path)
+    if path.is_symlink():
+        path = path.resolve()
+    try:
+        linked = path.stat().st_nlink > 1
+    except OSError:
+        linked = False
+    if linked:
+        with open(path, "wb") as f:
+            f.write(data)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def write_text_keep_link(path, text):
+    write_bytes_keep_link(path, text.encode("utf-8"))
 
 
 def append_text(path, text):
@@ -167,7 +205,9 @@ class FileLock:
                 os.write(fd, str(os.getpid()).encode())
                 os.close(fd)
                 return True
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
+                # Windows reports a lock file that is being deleted as
+                # PermissionError, not FileExistsError.
                 try:
                     if time.time() - self.path.stat().st_mtime > self.stale:
                         self.path.unlink()
@@ -193,6 +233,34 @@ class FileLock:
         self.release()
 
 
+_vault_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def vault_lock(timeout=30.0):
+    """The one lock every read-modify-write of a vault file goes through.
+    Re-entrant within a thread, so a command that calls another locked
+    helper does not deadlock on itself. A timeout raises, never skips."""
+    if getattr(_vault_lock_state, "depth", 0):
+        _vault_lock_state.depth += 1
+        try:
+            yield
+        finally:
+            _vault_lock_state.depth -= 1
+        return
+    lock = FileLock(state_dir() / "vault.lock", timeout=timeout)
+    if not lock.acquire():
+        raise TimeoutError(f"could not get the vault lock {lock.path} within {timeout:.0f}s. "
+                           "Another mem command may be stuck; retry, or delete that file "
+                           "if no mem process is running")
+    _vault_lock_state.depth = 1
+    try:
+        yield
+    finally:
+        _vault_lock_state.depth = 0
+        lock.release()
+
+
 # ----------------------------------------------------------------- frontmatter
 
 FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?", re.S)
@@ -200,6 +268,7 @@ FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?", re.S)
 
 def parse_frontmatter(text):
     """Minimal flat YAML: `key: value` lines. Returns (dict, body)."""
+    text = text.lstrip("\ufeff")
     m = FM_RE.match(text)
     if not m:
         return {}, text

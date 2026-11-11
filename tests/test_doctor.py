@@ -38,7 +38,7 @@ class DoctorTest(unittest.TestCase):
         cfg["python"] = gone
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
         hook = self.h.app / "hook.sh"
-        hook.write_text(re.sub(r'^PY=".*"$', f'PY="{gone}"', hook.read_text(encoding="utf-8"),
+        hook.write_text(re.sub(r"^PY='.*'$", f"PY='{gone}'", hook.read_text(encoding="utf-8"),
                                flags=re.M), encoding="utf-8")
         # Doctor itself runs on any interpreter; call it directly.
         r = subprocess.run([sys.executable, str(self.h.app / "runtime" / "run.py"), "cli",

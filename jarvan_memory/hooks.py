@@ -11,10 +11,10 @@ Rules every handler follows:
   sanitised first.
 """
 import json
-import math
 import os
+import posixpath
 import re
-import sys
+import shlex
 import time
 from pathlib import Path
 
@@ -32,20 +32,11 @@ RECALL_MAX = 2
 
 # ----------------------------------------------------------------- session state
 
-def safe_sid(sid):
-    sid = str(sid or "")
-    clean = re.sub(r"[^A-Za-z0-9_-]", "", sid)
-    if not clean or clean != sid or len(clean) > 100:
-        import hashlib
-        return "h" + hashlib.sha256(sid.encode()).hexdigest()[:24] if sid else "nosession"
-    return clean
-
-
 class Session:
     def __init__(self, payload):
         self.payload = payload
         self.raw_id = payload.get("session_id") or ""
-        self.sid = safe_sid(self.raw_id)
+        self.sid = util.safe_sid(self.raw_id)
         self.probe = str(self.raw_id).startswith(PROBE_PREFIX)
         self.path = util.state_dir() / "sessions" / f"{self.sid}.json"
         self.data = None
@@ -127,12 +118,17 @@ def session_start(payload):
         sess.load()
         sess.save()
     heartbeat("SessionStart", sess)
+    unseen = None
     if not sess.probe:
         _prune()
         from . import jobs
         jobs.maybe_schedule_sweep(cfg)
-    text = build_context(cfg, sess, source)
+        unseen = _unseen_hook_errors()
+    text = build_context(cfg, sess, source, unseen)
     emit("SessionStart", text)
+    if unseen:
+        # Marked only after the reply went out, like the stop gate's block.
+        util.write_text(_hook_errors_shown(), str(unseen[2]))
 
 
 def _prune():
@@ -149,7 +145,44 @@ def _prune():
                 pass
 
 
-def build_context(cfg, sess, source):
+HOOK_ERRORS_LOG_MAX_BYTES = 256 * 1024
+
+
+def hook_errors_log():
+    return util.state_dir() / "hook-errors.log"
+
+
+def _hook_errors_shown():
+    return util.state_dir() / "hook-errors.shown"
+
+
+def _unseen_hook_errors():
+    """(count, last line, log size) of hook-errors.log entries not yet shown
+    at a session start, or None. Hooks fail silently by design (they must not
+    break the session), so this is where a failure becomes visible."""
+    log = hook_errors_log()
+    try:
+        size = log.stat().st_size
+        if size > HOOK_ERRORS_LOG_MAX_BYTES:
+            tail = util.read_text(log).split("\n")[-200:]
+            util.write_text(log, "\n".join(tail))
+            size = log.stat().st_size
+            util.write_text(_hook_errors_shown(), "0")
+        shown = _read_int(_hook_errors_shown())
+        if shown > size:
+            shown = 0
+        if size == shown:
+            return None
+        with open(log, "rb") as f:
+            f.seek(shown)
+            data = f.read()
+    except OSError:
+        return None
+    lines = [l for l in data.decode("utf-8", "replace").splitlines() if l.strip()]
+    return (len(lines), lines[-1], size) if lines else None
+
+
+def build_context(cfg, sess, source, unseen=None):
     vroot = Path(cfg["vault"])
     mem = mem_cmd(cfg)
     parts = [
@@ -168,6 +201,10 @@ def build_context(cfg, sess, source):
     errs = _job_errors()
     if errs:
         warnings.append("Background job problems: " + "; ".join(errs))
+    if unseen:
+        warnings.append(f"{unseen[0]} hook error(s) since the last session start; the last: "
+                        f"{unseen[1]} (full log: {util.fwd(hook_errors_log())}). Hooks fail "
+                        f"silently by design; run `{mem} doctor`. Tell the user.")
     if source == "compact" and (sess.data or {}).get("wrote_at", -1) < 0:
         warnings.append("Context was just compacted and nothing from this session is in memory "
                         "yet. While the summary still holds what was decided, write the durable "
@@ -348,15 +385,15 @@ def route(prompt, cfg, seen=()):
     costs a prompt no more than a small one."""
     from . import search
     terms = search.query_terms(prompt)
-    if len(terms) < 2:
+    if len(terms) < ROUTE_MIN_MATCHED:
         return []
     out = []
-    for r in search.search(prompt, k=4, cfg=cfg, per_file=1, exclude=ROUTE_EXCLUDE):
+    for r in search.search(prompt, k=4, cfg=cfg, per_file=1, exclude=ROUTE_EXCLUDE,
+                           budget=search.HOOK_INDEX_BUDGET):
         if r["status"] == "refuted" or r["path"] in seen:
             continue
         m = len(r["matched"])
-        if m >= min(ROUTE_MIN_MATCHED, len(terms)) and m / len(terms) >= ROUTE_MIN_RATIO \
-                and m >= 2:
+        if m >= ROUTE_MIN_MATCHED and m / len(terms) >= ROUTE_MIN_RATIO:
             out.append(r)
         if len(out) >= ROUTE_MAX:
             break
@@ -365,28 +402,106 @@ def route(prompt, cfg, seen=()):
 
 # ----------------------------------------------------------------- PostToolUse
 
-def _norm(p):
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+
+def _slash(p):
     p = str(p).replace("\\", "/")
-    m = re.match(r"^/([a-zA-Z])/(.*)$", p)
-    if m:
-        p = f"{m.group(1)}:/{m.group(2)}"
     if os.name == "nt":
-        p = p.lower()
-    return p.rstrip("/")
+        m = re.match(r"^/([a-zA-Z])(?:/(.*))?$", p)
+        if m:
+            p = f"{m.group(1)}:/{m.group(2) or ''}"
+    return p
+
+
+def _is_abs(p):
+    s = _slash(os.path.expanduser(str(p).strip()))
+    return s.startswith("/") or bool(re.match(r"^[A-Za-z]:/", s))
+
+
+def _abs(p, cwd=None):
+    """Absolute, normalised, comparable form of a path typed in a tool call;
+    a relative one is taken against `cwd`. On Windows Git Bash's /c/... and
+    C:\\... name the same file, and case does not matter."""
+    s = _slash(os.path.expanduser(str(p).strip()))
+    if not _is_abs(s):
+        s = _slash(cwd or os.getcwd()).rstrip("/") + "/" + s
+    s = posixpath.normpath(s)
+    return s.lower() if os.name == "nt" else s
+
+
+def _under(path, folder):
+    return path == folder or path.startswith(folder + "/")
+
+
+_SHELL_BREAKS = set("();|&")
+_WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&"}
+_READ_REDIRECTS = {"<", "<<", "<<<", "<&"}
+_POWERSHELL_WRITERS = {"out-file", "add-content", "set-content"}
+
+
+def bash_writes(cmd, cwd=None):
+    """Absolute paths a shell command line writes: redirections, tee, the
+    destination of cp, everything mv and rm touch, files of sed -i. Relative
+    paths follow `cd X &&`. Reading (cat, grep) writes nothing. Interpreter
+    one-liners (python -c) are not parsed: a documented limit."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)
+    except ValueError:
+        toks = cmd.split()
+    commands, words = [], []
+    for t in toks:
+        if set(t) <= _SHELL_BREAKS:
+            commands.append(words)
+            words = []
+        else:
+            words.append(t)
+    commands.append(words)
+    out, cur = [], cwd or os.getcwd()
+    for words in commands:
+        argv, targets, i = [], [], 0
+        while i < len(words):
+            w = words[i]
+            if w in _WRITE_REDIRECTS or w in _READ_REDIRECTS:
+                if i + 1 < len(words) and w in _WRITE_REDIRECTS and \
+                        not (w == ">&" and (words[i + 1].isdigit() or words[i + 1] == "-")):
+                    targets.append(words[i + 1])
+                i += 2
+                continue
+            argv.append(w)
+            i += 1
+        name = posixpath.basename(argv[0].replace("\\", "/")).lower() if argv else ""
+        args = [a for a in argv[1:] if not a.startswith("-")]
+        if name in ("cd", "pushd") and args:
+            cur = _abs(args[0], cur)
+            continue
+        if name == "tee" or name == "rm":
+            targets += args
+        elif name == "mv":
+            targets += args
+        elif name == "cp" and args:
+            targets.append(args[-1])
+        elif name == "sed" and any(re.match(r"^-[A-Za-z]*i|^--in-place", a) for a in argv[1:]):
+            targets += args
+        elif name in _POWERSHELL_WRITERS:
+            targets += args
+        out += [_abs(t, cur) for t in targets]
+    return out
 
 
 def touches_vault(payload, cfg):
-    vroot = _norm(Path(cfg["vault"]).resolve())
+    vroot = _abs(Path(cfg["vault"]).resolve())
     tool = payload.get("tool_name", "")
     ti = payload.get("tool_input") or {}
-    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+    cwd = payload.get("cwd")
+    if tool in WRITE_TOOLS:
         fp = ti.get("file_path") or ti.get("notebook_path") or ""
-        return bool(fp) and (_norm(fp) + "/").startswith(vroot + "/")
+        return bool(fp) and _under(_abs(fp, cwd), vroot)
     if tool == "Bash":
         cmd = ti.get("command") or ""
-        # Broad on purpose: a false positive only delays the stop gate's
-        # question, a false negative asks a session that already wrote.
-        if vroot in _norm(cmd):
+        if any(_under(t, vroot) for t in bash_writes(cmd, cwd)):
             return True
         return bool(MEM_WRITE_RE.search(cmd))
     return False
@@ -416,22 +531,25 @@ STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
 def guard_reason(payload, cfg):
     """Why this tool call must be refused, or None. The worklog's timestamps
     come from the clock in `mem log`; a hand-typed one is invented."""
-    wl = _norm(Path(cfg["vault"]).resolve() / V.WORKLOG)
+    wl = _abs(Path(cfg["vault"]).resolve() / V.WORKLOG)
     tool = payload.get("tool_name", "")
     ti = payload.get("tool_input") or {}
+    cwd = payload.get("cwd")
     mem = mem_cmd(cfg)
     msg = (f"Blocked: the worklog is append-only and its timestamps are generated by code "
            f"(the model has no clock). Use `{mem} log \"<what happened>\" --done` or "
-           f"`--handoff <slug>`. To correct an old line, use Edit on that one line.")
-    if tool == "Write":
-        fp = _norm(ti.get("file_path", ""))
-        if fp.startswith(wl + "/"):
+           f"`--handoff <slug>`. A wrong old line is for the user to fix by hand.")
+    if tool in WRITE_TOOLS:
+        fp = ti.get("file_path") or ti.get("notebook_path") or ""
+        # The tools take absolute paths. A relative one is ambiguous (the
+        # payload does not say what the tool resolves it against), so it is
+        # tested against the cwd and against the vault root.
+        bases = [cwd] if _is_abs(fp) else [cwd, Path(cfg["vault"]).resolve()]
+        if fp and any(_under(_abs(fp, b), wl) for b in bases):
             return msg
     elif tool == "Bash":
         cmd = ti.get("command") or ""
-        ncmd = _norm(cmd)
-        writes = re.search(r">>|(?<![<>=])>(?!=)|\btee\b|\bsed\s+-i|Out-File|Add-Content|Set-Content", cmd)
-        if writes and ("/" + V.WORKLOG + "/") in ncmd and STAMP_RE.search(cmd):
+        if STAMP_RE.search(cmd) and any(_under(t, wl) for t in bash_writes(cmd, cwd)):
             return msg
     return None
 
@@ -541,7 +659,8 @@ def _recall_view(text, cfg, seen):
     terms = search.query_terms(text)
     if len(terms) < 3:
         return []
-    results = search.search(text, k=6, cfg=cfg, per_file=1, exclude=ROUTE_EXCLUDE)
+    results = search.search(text, k=6, cfg=cfg, per_file=1, exclude=ROUTE_EXCLUDE,
+                            budget=search.HOOK_INDEX_BUDGET)
     results = [r for r in results if r["status"] != "refuted" and r["path"] not in seen]
     if not results:
         return []
@@ -645,16 +764,19 @@ def main(event):
         if event == "session-start":
             emit("SessionStart", f"[jarvan-memory] {e} Re-run the installer.")
     except Exception as e:  # never break the user's session
+        _log_hook_error(event, e)
         if event == "session-start":
             emit("SessionStart", f"[jarvan-memory] session-start hook failed: "
                                  f"{type(e).__name__}: {e}. Run `mem doctor`.")
-        _log_hook_error(event, e)
+        else:
+            # The log is read at the next session start and by `mem doctor`.
+            util.err(f"jarvan-memory: {event} hook failed: {type(e).__name__}: {e}")
     return 0
 
 
 def _log_hook_error(event, e):
     try:
-        util.append_text(util.state_dir() / "hook-errors.log",
+        util.append_text(hook_errors_log(),
                          f"{util.stamp()} {event} {type(e).__name__}: {e}\n")
     except Exception:
         pass

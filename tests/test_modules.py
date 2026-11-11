@@ -4,11 +4,11 @@ canned reply; everything else (detached spawn, locking, schema check, git)
 is real."""
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import unittest
-from pathlib import Path
 
 from helpers import BASH, FakeHome, ctx
 
@@ -24,7 +24,11 @@ with open(os.path.join(d, "calls.jsonl"), "a", encoding="utf-8") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "child": os.environ.get("JARVAN_MEMORY_CHILD"),
                         "prompt": prompt[:20000]}) + "\n")
 with open(os.path.join(d, "reply.txt"), encoding="utf-8") as f:
-    sys.stdout.write(f.read())
+    reply = f.read()
+if reply == "EXIT1":
+    sys.stderr.write("boom: fake auth failure")
+    sys.exit(1)
+sys.stdout.write(reply)
 '''
 
 
@@ -146,6 +150,37 @@ class ModulesTest(unittest.TestCase):
         while time.time() < deadline and "### Decisions" not in self.daily():
             time.sleep(0.5)
         self.assertIn("### Decisions", self.daily())
+
+    def seed_sweep(self):
+        self.h.mem("infer", "claim", "Fixture timings are stable", "--scope", "project",
+                   "--text", "fixture timings stay under one second")
+        self.h.mem("log", "measured fixture timings: parser fixtures take 4 seconds now", "--done")
+
+    def job_errors(self):
+        p = self.h.app / "state" / "job-errors.json"
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+    def test_a_failing_child_is_reported_for_summary_and_for_sweep(self):
+        self.reply("EXIT1")
+        self.end_job(5000)
+        self.assertIn("summary", self.job_errors())
+        self.seed_sweep()
+        self.assertEqual(self.job("sweep").returncode, 0)
+        self.assertIn("sweep", self.job_errors(), "the same run must not clear its own error")
+        out = ctx(self.h.hook("session-start", {"source": "startup"}))
+        self.assertIn("sweep", out)
+        self.assertIn("summary", out)
+        self.reply("[]")
+        self.job("sweep")
+        self.assertNotIn("sweep", self.job_errors(), "a clean later run clears it")
+
+    def test_sweep_prompt_fence_carries_a_nonce(self):
+        self.seed_sweep()
+        self.reply("[]")
+        self.job("sweep")
+        prompt = self.calls()[-1]["prompt"]
+        nonce = re.search(r"^--- BEGIN DATA ([0-9a-f]{16}) ---$", prompt, re.M).group(1)
+        self.assertIn(f"--- END DATA {nonce} ---", prompt)
 
     def test_sweep_proposes_only_quote_backed_refutations(self):
         self.h.mem("infer", "claim", "Fixture timings are stable", "--scope", "project",

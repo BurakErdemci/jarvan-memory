@@ -4,6 +4,7 @@ silent unless the match is strong; the no-FTS5 fallback finds the same note."""
 import os
 import shutil
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -68,6 +69,26 @@ class SearchUnitTest(unittest.TestCase):
             res = search.search("roll back release migration", root=self.root, cfg=self.cfg)
         self.assertEqual(res[0]["path"], "topics/Deploy.md")
 
+    def test_line_numbers_count_only_newlines(self):
+        # U+2028 and form feed are not line breaks for an editor or the Read tool.
+        p = self.root / "topics" / "Pasted.md"
+        p.write_bytes("# Pasted\n\nfirst\u2028second\x0cthird\n\n## Zebra migration plan\n\n"
+                      "migrate the zebra database nightly\n".encode("utf-8"))
+        res = search.search("zebra migration plan database", root=self.root, cfg=self.cfg)
+        real = next(i for i, l in enumerate(p.read_bytes().decode("utf-8").split("\n"), 1)
+                    if l.startswith("## Zebra"))
+        self.assertEqual(res[0]["path"], "topics/Pasted.md")
+        self.assertEqual(res[0]["start"], real)
+        self.assertEqual(res[0]["lines"][0][0], real + 2)
+
+    def test_refuted_and_promoted_records_weigh_less(self):
+        now = time.time()
+        live = search._weight("", "Heading", now, "topics/a.md")
+        self.assertLessEqual(search._weight("refuted", "Heading", now, "inferences/a.md"),
+                             0.31 * live)
+        self.assertLessEqual(search._weight("promoted", "Heading", now, "inferences/a.md"),
+                             0.51 * live)
+
     def test_turkish_stemmer_plugin(self):
         cfg = dict(self.cfg, stemmer="tr")
         res = search.search("notlarımızda kural", root=self.root, cfg=cfg)
@@ -95,6 +116,33 @@ class SuggestTest(HomeTest):
         out = self.prompt("database migration rollback plan for kubernetes helm terraform "
                           "ansible secrets rotation")
         self.assertEqual(out, "")
+
+    def test_two_matched_words_are_never_enough(self):
+        # Both content words hit the Deploy note; the gate wants three.
+        self.assertEqual(self.prompt("rollback migration"), "")
+
+    def test_index_trigger_words_count_toward_the_gate(self):
+        (self.h.vault / "topics" / "Gizmo.md").write_text(
+            "# Gizmo\n\n## Notes\n\nunrelated words only here\n", encoding="utf-8")
+        idx = self.h.vault / "INDEX.md"
+        idx.write_text(idx.read_text(encoding="utf-8") +
+                       "- [[topics/Gizmo]] \u2014 how do I rebuild the gizmo pipeline safely\n",
+                       encoding="utf-8")
+        self.assertIn("topics/Gizmo.md", self.prompt("how do I rebuild the gizmo pipeline safely"))
+
+    def test_a_non_ascii_prompt_reaches_the_suggestion(self):
+        out = self.prompt("sabahlar\u0131 derin i\u015f \u00f6\u011fleden sonra toplant\u0131")
+        self.assertIn("topics/Calisma.md", out)
+
+    def test_refuted_records_are_never_suggested(self):
+        rec = self.h.vault / "inferences" / "r1.md"
+        body = ("# r1\n\n## Claim\n\nroll back staging release by deleting the cache "
+                "directory entirely\n")
+        ask = "how do I roll back the staging release by deleting the cache directory"
+        rec.write_text("---\ntitle: r1\nstatus: unverified\n---\n" + body, encoding="utf-8")
+        self.assertIn("inferences/r1.md", self.prompt(ask), "control: an unverified one is")
+        rec.write_text("---\ntitle: r1\nstatus: refuted\n---\n" + body, encoding="utf-8")
+        self.assertNotIn("inferences/r1.md", self.prompt(ask))
 
     def test_unrelated_prompt_is_silent(self):
         self.assertEqual(self.prompt("write a haiku about autumn leaves"), "")

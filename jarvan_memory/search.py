@@ -16,7 +16,11 @@ from pathlib import Path
 
 from . import util, vault as V
 
-SCHEMA = "4"
+SCHEMA = "5"
+# Hooks must answer inside their own timeout (10 s). Indexing a big vault
+# from cold takes longer, so a hook indexes for at most this long, stays
+# silent for that prompt and carries on at the next call.
+HOOK_INDEX_BUDGET = 3.0
 # Not searched: raw logs and machine output. Worklog lines are pointers and
 # daily summaries are distilled copies; both would outrank the real notes.
 EXCLUDE_TOP = {V.WORKLOG, V.DAILY, V.TEMPLATES, V.SWEEPS}
@@ -62,7 +66,11 @@ def split_sections(text, fallback_title):
     """[(heading_chain, start_line, end_line, body, body_start)], 1-based.
     Sections with an empty body are skipped."""
     meta, _ = util.parse_frontmatter(text)
-    lines = text.splitlines()
+    # Only "\n" ends a line: str.splitlines also splits on U+2028, form feed
+    # and others, which an editor and the Read tool do not count.
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     start = 0
     if text.startswith("---"):
         for i in range(1, len(lines)):
@@ -102,7 +110,7 @@ def _connect(path):
 def _create(con, fts):
     con.executescript("""
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-    CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime_ns INTEGER, size INTEGER);
+    CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime_ns INTEGER, size INTEGER, trig TEXT);
     CREATE TABLE IF NOT EXISTS sections(id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT, heading TEXT, start INTEGER, end INTEGER, body TEXT,
         status TEXT, mtime REAL, bstart INTEGER, fheading TEXT, fbody TEXT, stems TEXT, triggers TEXT);
@@ -141,10 +149,12 @@ def _triggers(root):
     return out
 
 
-def update_index(root=None, cfg=None):
-    """Incremental: re-index files whose (mtime, size) changed. Returns the
-    open connection. If another process holds the write lock, the last
-    committed index is used as is."""
+def update_index(root=None, cfg=None, budget=None):
+    """Incremental: re-index files whose (mtime, size, trigger text) changed.
+    Returns the open connection. If another process holds the write lock, the
+    last committed index is used as is. With a `budget` in seconds, stops
+    when it is spent, commits what fit and marks the index incomplete (see
+    `is_complete`); the next call continues where this one stopped."""
     cfg = cfg if cfg is not None else util.load_config(required=False)
     root = Path(root or util.vault_dir(cfg))
     stem = _stemmer(cfg)
@@ -167,29 +177,45 @@ def update_index(root=None, cfg=None):
         con.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError:
         return con
+    deadline = time.time() + budget if budget else None
     try:
-        known = {r[0]: (r[1], r[2]) for r in con.execute("SELECT * FROM files")}
+        known = {r[0]: (r[1], r[2], r[3]) for r in con.execute("SELECT * FROM files")}
         seen = set()
-        trig_sig = hashlib.sha256(repr(sorted(triggers.items())).encode()).hexdigest()
-        old_trig = con.execute("SELECT value FROM meta WHERE key='trig'").fetchone()
-        force_all = not old_trig or old_trig[0] != trig_sig
+        complete, indexed = True, 0  # at least one file per call: always progress
         for p in _wanted_files(root):
             r = p.relative_to(root).as_posix()
             seen.add(r)
             st = p.stat()
-            if not force_all and known.get(r) == (st.st_mtime_ns, st.st_size):
+            trig = _trigger_for(triggers, r, p)
+            sig = hashlib.sha256(trig.encode()).hexdigest()[:16]
+            if known.get(r) == (st.st_mtime_ns, st.st_size, sig):
+                continue
+            if deadline and indexed and time.time() > deadline:
+                complete = False
                 continue
             _drop(con, r, fts)
-            _index_file(con, root, p, r, st, stem, triggers, fts)
-        for r in set(known) - seen:
-            _drop(con, r, fts)
-            con.execute("DELETE FROM files WHERE path=?", (r,))
-        con.execute("INSERT OR REPLACE INTO meta VALUES('trig', ?)", (trig_sig,))
+            _index_file(con, root, p, r, st, stem, trig, sig, fts)
+            indexed += 1
+        if complete:
+            for r in set(known) - seen:
+                _drop(con, r, fts)
+                con.execute("DELETE FROM files WHERE path=?", (r,))
+        con.execute("INSERT OR REPLACE INTO meta VALUES('complete', ?)", (str(int(complete)),))
         con.commit()
     except Exception:
         con.rollback()
         raise
     return con
+
+
+def is_complete(con):
+    """False while a budgeted update_index still has files left to index."""
+    row = con.execute("SELECT value FROM meta WHERE key='complete'").fetchone()
+    return bool(row) and row[0] == "1"
+
+
+def _trigger_for(triggers, r, p):
+    return triggers.get(util.fold(r[:-3]), "") or triggers.get(util.fold(p.stem), "")
 
 
 def _drop(con, r, fts):
@@ -198,11 +224,9 @@ def _drop(con, r, fts):
     con.execute("DELETE FROM sections WHERE path=?", (r,))
 
 
-def _index_file(con, root, p, r, st, stem, triggers, fts):
-    text = util.read_text(p).lstrip("﻿")
-    secs, meta = split_sections(text, p.stem.replace("_", " "))
+def _index_file(con, root, p, r, st, stem, trig, sig, fts):
+    secs, meta = split_sections(util.read_text(p), p.stem.replace("_", " "))
     status = meta.get("status", "")
-    trig = triggers.get(util.fold(r[:-3]), "") or triggers.get(util.fold(p.stem), "")
     fpath = util.fold(r[:-3]).replace("_", " ").replace("/", " ")
     for i, (head, s, e, body, bstart) in enumerate(secs):
         fh, fb = util.fold(head), util.fold(body)
@@ -215,7 +239,8 @@ def _index_file(con, root, p, r, st, stem, triggers, fts):
         if fts:
             con.execute("INSERT INTO search(rowid,path,heading,body,stems,triggers) VALUES(?,?,?,?,?,?)",
                         (cur.lastrowid, fpath, fh, fb, stems, t))
-    con.execute("INSERT OR REPLACE INTO files VALUES(?,?,?)", (r, st.st_mtime_ns, st.st_size))
+    con.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?)",
+                (r, st.st_mtime_ns, st.st_size, sig))
 
 
 # ----------------------------------------------------------------- querying
@@ -272,7 +297,10 @@ def _best_lines(terms, body_lines, start, n=3):
     return [(start + i, line[:200]) for _, i, line in scored[:n]]
 
 
-def search(text, k=5, root=None, cfg=None, per_file=2, exclude=()):
+def search(text, k=5, root=None, cfg=None, per_file=2, exclude=(), budget=None):
+    """Best sections for `text`. With a `budget` (hooks), an index that could
+    not be brought up to date inside it gives no answer at all: a partial
+    index would suggest the wrong notes with confidence."""
     cfg = cfg if cfg is not None else util.load_config(required=False)
     root = Path(root or util.vault_dir(cfg))
     terms = query_terms(text)
@@ -280,15 +308,17 @@ def search(text, k=5, root=None, cfg=None, per_file=2, exclude=()):
         return []
     stem = _stemmer(cfg)
     stems = {w: stem(w) for _, w in terms} if stem else {}
-    con = update_index(root, cfg)
+    con = update_index(root, cfg, budget=budget)
     try:
+        if budget and not is_complete(con):
+            return []
         if fts5_available():
             q = " OR ".join(f'"{t}"*' for t, _ in terms)
             if stems:
                 q += " OR " + " OR ".join(f'stems:"{s}"' for s in sorted(set(stems.values())))
             rows = con.execute(
                 "SELECT s.id, s.path, s.heading, s.start, s.end, s.body, s.status, s.mtime, s.bstart,"
-                " -bm25(search, 2.0, 6.0, 1.0, 1.0, 4.0) FROM search JOIN sections s"
+                " s.triggers, -bm25(search, 2.0, 6.0, 1.0, 1.0, 4.0) FROM search JOIN sections s"
                 " ON s.id = search.rowid WHERE search MATCH ? ORDER BY bm25(search, 2.0,"
                 " 6.0, 1.0, 1.0, 4.0) LIMIT 100", (q,)).fetchall()
         else:
@@ -296,10 +326,11 @@ def search(text, k=5, root=None, cfg=None, per_file=2, exclude=()):
     finally:
         con.close()
     results = []
-    for _id, path, head, s, e, body, status, mtime, bstart, score in rows:
+    for _id, path, head, s, e, body, status, mtime, bstart, trig, score in rows:
         if path in exclude:
             continue
-        hit = _matched(terms, stems, head + "\n" + body)
+        # INDEX trigger text counts toward the match, as AGENT.md promises.
+        hit = _matched(terms, stems, head + "\n" + body + "\n" + (trig or ""))
         results.append({"path": path, "start": s, "end": e, "heading": head, "bstart": bstart,
                         "status": status, "body": body, "matched": hit,
                         "score": score * _weight(status, head, mtime, path)})
@@ -309,7 +340,7 @@ def search(text, k=5, root=None, cfg=None, per_file=2, exclude=()):
         if per.get(r["path"], 0) >= per_file:
             continue
         per[r["path"]] = per.get(r["path"], 0) + 1
-        r["lines"] = _best_lines(terms, r["body"].splitlines(), r["bstart"]) or [(r["start"], r["heading"])]
+        r["lines"] = _best_lines(terms, r["body"].split("\n"), r["bstart"]) or [(r["start"], r["heading"])]
         out.append(r)
         if len(out) >= k:
             break
@@ -339,8 +370,8 @@ def _scan(con, terms):
             if any(x.startswith(t) for x in util.words(r[10])):
                 score += idf
         if score:
-            out.append(r[:9] + (score,))
-    out.sort(key=lambda x: -x[9])
+            out.append(r[:9] + (r[11] or "", score))
+    out.sort(key=lambda x: -x[10])
     return out[:100]
 
 

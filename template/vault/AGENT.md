@@ -133,6 +133,8 @@ delete it when the work is finished. Lasting facts go to the vault, not there.
 - **Stop gate.** After a long stretch with no memory write, finishing a turn is
   paused once with a question. Answer honestly: one worklog line is enough if
   nothing durable happened. It asks again after another long stretch.
-- **Worklog guard.** Writing worklog lines by hand is refused; use `mem log`.
-- **Suggestions.** When a prompt clearly matches a note, its line range is
+- **Worklog guard.** Writing into the worklog folder with Write/Edit, or typing
+  a timestamp into it from the shell, is refused; use `mem log`.
+- **Suggestions.** When a prompt clearly matches a note (at least three of its
+  content words, counting the note's INDEX trigger text), its line range is
   suggested. Silence means no strong match, not "no note".

@@ -21,7 +21,7 @@ class PrivacyTest(unittest.TestCase):
     def test_no_personal_strings(self):
         leaks = []
         for p in REPO.rglob("*"):
-            if not p.is_file() or ".git" in p.parts or "__pycache__" in p.parts:
+            if not p.is_file() or {".git", "__pycache__", ".delegate-runs"} & set(p.parts):
                 continue
             if p.suffix not in TEXT_SUFFIXES or p.name == "test_privacy.py":
                 continue

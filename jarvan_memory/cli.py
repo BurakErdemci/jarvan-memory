@@ -253,4 +253,7 @@ def main(argv=None):
     except util.NotInstalled as e:
         util.err(f"mem: {e}")
         return 1
+    except TimeoutError as e:
+        util.err(f"mem: {e}")
+        return 1
     return rc or 0

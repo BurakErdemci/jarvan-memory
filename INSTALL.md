@@ -19,8 +19,10 @@ no network service, no pip packages.
 
 ## 1. Requirements
 
-**Python 3.9 or newer** (standard library only) and, on Windows, **Git for
-Windows** (Claude Code on Windows already requires it; hooks run in Git Bash).
+**Python 3.9 or newer** (standard library only) and **Git** on every OS: step 2
+clones the repository with it, and the optional `backup` module commits the
+vault with it. On Windows it is **Git for Windows**, which Claude Code already
+requires (hooks run in Git Bash).
 
 Check Python. Run each and keep the first that prints a version of 3.9+:
 
@@ -41,9 +43,20 @@ hint instead of running. It does not count. If none works, install Python:
 | Fedora | `sudo dnf install python3` | same |
 | Arch | `sudo pacman -S python` | same |
 
+Check git with `git --version`; if it is missing:
+
+| OS | Install |
+|---|---|
+| Windows | `winget install -e --id Git.Git` (then open a new terminal) |
+| macOS | `xcode-select --install`, or `brew install git` |
+| Debian/Ubuntu | `sudo apt install git` |
+| Fedora | `sudo dnf install git` |
+| Arch | `sudo pacman -S git` |
+
 Ask the user before installing anything system-wide. If `sqlite3` fails to
 import, the Python build is incomplete; install the distribution's full
-python3 package.
+python3 package. Without git you can still download the repository as a zip
+instead of cloning it; only the `backup` module then stays unavailable.
 
 ## 2. Get the code
 
@@ -89,7 +102,14 @@ The installer:
 - creates the vault skeleton (existing files are left alone),
 - backs up `settings.json` next to itself and merges seven hooks into it, keeping every existing setting and hook,
 - appends a marked block to `~/.claude/CLAUDE.md` that points to the vault's contract,
+- builds the search index,
 - runs `mem doctor`.
+
+It checks everything first (`settings.json` is a JSON object, `CLAUDE.md` is
+UTF-8, the vault path is usable) and refuses with a plain message before
+writing anything. If a step fails after that, it puts back what this run
+wrote. The installer prints the full path of the `mem` launcher as
+`command:`; use that path wherever this file says `mem`.
 
 ## 5. Read the doctor output
 
@@ -140,8 +160,9 @@ still print N/N.
 Tell the user, in their language:
 - where the vault is and that it is plain Markdown they can read and edit,
 - that the memory starts working in the **next** Claude Code session (restart it),
-- the one command worth knowing: `mem search "<question>"`,
-- how to remove it: `mem uninstall` (keeps the vault; `--purge-vault --yes` deletes it too).
+- the one command worth knowing: `<claude config>/jarvan-memory/bin/mem search "<question>"`,
+- how to remove it: `<claude config>/jarvan-memory/bin/mem uninstall` (keeps the vault;
+  `--purge-vault --yes` deletes it too, but only a vault this installer created).
 
 The full `mem` path is `<claude config>/jarvan-memory/bin/mem` (`mem.cmd` for
 cmd/PowerShell). Agents get it from the session-start block; users who want a
@@ -149,7 +170,11 @@ short `mem` can add `<claude config>/jarvan-memory/bin` to their PATH.
 
 ## Uninstall
 
-`mem uninstall` removes exactly what the installer added: our hook entries
-from `settings.json` (restoring the original bytes when nothing else changed),
-the marked CLAUDE.md block, the settings backups, and the runtime folder. The
-vault is kept unless the user explicitly asks for `--purge-vault --yes`.
+`<claude config>/jarvan-memory/bin/mem uninstall` removes exactly what the
+installer added: our hook entries from `settings.json` (restoring the original
+bytes when nothing else changed since install), the marked CLAUDE.md block,
+the settings backups, and the runtime folder. A `settings.json` or `CLAUDE.md`
+that is a symlink or hard link stays linked. The vault is kept unless the user
+explicitly asks for `--purge-vault --yes`; even then it is deleted only if the
+installer created it (a folder that existed before install is never deleted)
+and it is not the home directory, a drive root or the Claude config folder.

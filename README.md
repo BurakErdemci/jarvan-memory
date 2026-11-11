@@ -6,7 +6,7 @@ notlardan oluşan bir klasörle taşır. Notları tek bir komut (`mem`) yazar,
 tarihleri hep o damgalar; birkaç kanca da doğru notu doğru anda önüne koyar.
 
 - Yalnız Python standart kütüphanesi. pip yok, ağ servisi yok, API anahtarı yok.
-- Windows, macOS ve Linux.
+- Windows, macOS ve Linux. Python 3.9+ ve git gerekir (git: depoyu klonlamak ve `backup` modülü için).
 - Notlar sizindir: herhangi bir editörle ya da Obsidian'la açılan sıradan bir klasör.
 
 ## Kurulum
@@ -38,8 +38,9 @@ doğrulanmamış çıkarımların sayısı. Blok bir *kayıttır*, talimat deği
 tarihine bakılarak kullanılır.
 
 **Her isteminizde** istem bir notla güçlü biçimde eşleşirse o notun ilgili
-satır aralığını önerir. Eşleşme zayıfsa hiçbir şey söylemez; böylece büyük bir
-hafıza her istemde küçük bir hafıza kadar yer kaplar.
+satır aralığını önerir (en az üç anlamlı kelime eşleşmeli; notun INDEX tetik
+satırındaki kelimeler de sayılır). Eşleşme zayıfsa hiçbir şey söylemez; böylece
+büyük bir hafıza her istemde küçük bir hafıza kadar yer kaplar.
 
 **Bir komut hata verdiğinde** aynı hata daha önce bir nota yazılmışsa en çok
 iki notu hatırlatır.
@@ -50,7 +51,11 @@ sorar: devreden iş var mı, kalıcı bir karar ya da ölçüm çıktı mı? Yaz
 çalışma daha geçerse yeniden sorar.
 
 **İş günlüğüne elle saat yazılmasını engeller.** Modelin saati yoktur; elle
-yazılan saat uydurmadır. Tarihleri hep `mem` damgalar.
+yazılan saat uydurmadır. Tarihleri hep `mem` damgalar. Kapsam: Write, Edit,
+MultiEdit ve NotebookEdit ile iş günlüğü klasörüne yazmak reddedilir; kabukta
+hedefi iş günlüğü klasörü olan, elle saat içeren `>`, `>>`, `tee`, `cp`, `mv`,
+`sed -i` komutları da reddedilir. `python -c` gibi yorumlayıcı tek satırlıkları
+denetlenmez.
 
 ## Hafıza klasörü
 
@@ -71,6 +76,9 @@ Klasör, dosya ve komut adları her dilde İngilizce kalır; notların metni siz
 dilinizde yazılır.
 
 ## `mem` komutları
+
+Aşağıdaki örneklerde `mem`, kurucunun `command:` satırında yazdığı tam yoldur
+(`~/.claude/jarvan-memory/bin/mem`).
 
 | Komut | Ne işe yarar |
 |---|---|
@@ -101,13 +109,17 @@ geçen notu bulur.
 ## Kaldırma
 
 ```sh
-mem uninstall                     # hafıza klasörü kalır
-mem uninstall --purge-vault --yes # hafıza klasörünü de siler
+~/.claude/jarvan-memory/bin/mem uninstall                     # hafıza klasörü kalır
+~/.claude/jarvan-memory/bin/mem uninstall --purge-vault --yes # hafıza klasörünü de siler
 ```
 
 Kaldırma, `settings.json`'a eklenen kancaları, `CLAUDE.md`'deki işaretli bloğu,
 ayar yedeklerini ve çalışma klasörünü siler. Kurulumdan sonra ayarlara başka
-bir şey eklenmediyse `settings.json` bayt bayt eski hâline döner.
+bir şey eklenmediyse `settings.json` ve `CLAUDE.md` bayt bayt eski hâline döner
+(sembolik ya da sabit bağlantı olan dosyalar bağlantılı kalır). `--purge-vault`
+yalnız kurucunun kendi oluşturduğu hafıza klasörünü siler; kurulumdan önce var
+olan bir klasörü, ev klasörünü, bir sürücü kökünü ya da Claude ayar klasörünü
+asla silmez, nedenini söyleyip hiçbir şey kaldırmadan durur.
 
 ## Belgeler
 
