@@ -468,6 +468,10 @@ def uninstall(purge_vault=False, yes=False):
     vroot = Path(cfg["vault"])
     app = util.app_dir()
     shutil.rmtree(app, ignore_errors=True)
+    if app.exists():
+        # Windows keeps a running mem.cmd open; say so instead of leaving it silently.
+        util.err(f"Could not remove everything in {app} (a file is in use). Delete that "
+                 "folder by hand; nothing in it is needed any more.")
     if purge_vault:
         shutil.rmtree(vroot, ignore_errors=True)
         util.out(f"Removed jarvan-memory and the vault {vroot}.")
