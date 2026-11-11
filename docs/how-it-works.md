@@ -101,8 +101,12 @@ one. A note is suggested once per session.
 
 **Large vaults.** `install.py` builds the search index. A hook never spends
 more than about 3 seconds indexing (`search.HOOK_INDEX_BUDGET`): if the index
-is missing or stale beyond that, it indexes what fits, stays silent for that
-prompt and carries on at the next call. `mem search` always indexes fully.
+is missing or stale beyond that, it indexes what fits, searches the sections
+already committed, and carries on at the next call. Notes larger than 512 KiB
+(524,288 bytes) are indexed only by the CLI; hooks skip them and continue with
+smaller notes. A large deferred note never hides matches from indexed notes.
+`mem search` always indexes fully, including oversized notes. Hook results may
+omit notes still awaiting indexing.
 Line numbers count only `\n` as a line break (not U+2028 or form feed), like an
 editor and the Read tool.
 

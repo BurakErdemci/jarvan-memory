@@ -177,6 +177,126 @@ class AuditTest(unittest.TestCase):
                         'echo evidence | mem verify claim', f'"{launcher}" log done'):
             self.assertTrue(hooks.touches_vault(self.bash(command), self.cfg), command)
 
+    def test_stop_gate_requires_the_mem_launcher_for_write_subcommands(self):
+        for command in ('git log example', 'git verify claim', 'other handoff open x',
+                        'echo ";" mem log example', 'echo "&&" mem verify claim',
+                        'echo "|" mem log example', 'echo "(" mem log example',
+                        'echo ">" mem log example', "echo '$(mem log x)'",
+                        '"VAR=1" mem log x',
+                        'git commit -m "x; mem log y"'):
+            with self.subTest(command=command):
+                self.assertFalse(hooks.touches_vault(self.bash(command), self.cfg))
+
+    def test_stop_gate_handles_prefixes_shells_and_command_substitution(self):
+        for command in ('VAR=1 mem log x', 'env X=1 mem log x',
+                        'sudo -u root env X=1 mem log x', 'time mem log x',
+                        'nohup mem log x &', 'xargs -n 1 mem log',
+                        'bash -c "mem log x"', "sh -c 'mem verify x'",
+                        'echo $(mem log x)', 'echo "$(mem log x)"'):
+            with self.subTest(command=command):
+                self.assertTrue(hooks.touches_vault(self.bash(command), self.cfg))
+
+    def test_guard_tracks_assignments_and_braces_but_scopes_subshell_variables(self):
+        vault = self.h.vault.as_posix()
+        outside = self.h.work.as_posix()
+        for command in (f'D="{vault}"; echo "2026-11-11 10:00" >> $D/worklog/a.md',
+                        f'D={vault} && echo "2026-11-11 10:00" >> "${{D}}/worklog/a.md"',
+                        f'{{ cd "{vault}"; }}; echo "2026-11-11 10:00" >> worklog/a.md',
+                        f'echo "2026-11-11 10:00" | sudo env X=1 tee {vault}/worklog/a.md'):
+            with self.subTest(command=command):
+                self.assertIsNotNone(hooks.guard_reason(self.bash(command), self.cfg))
+        command = (f'D={outside}; (D={vault}); '
+                   'echo "2026-11-11 10:00" >> $D/worklog/a.md')
+        self.assertIsNone(hooks.guard_reason(self.bash(command), self.cfg))
+
+    def test_guard_never_expands_single_quoted_or_escaped_variables(self):
+        with mock.patch.dict(os.environ, {"AUDIT_VAULT": self.h.vault.as_posix()}):
+            for target in ("'$AUDIT_VAULT/worklog/a.md'", "'${AUDIT_VAULT}'/worklog/a.md",
+                           r'\$AUDIT_VAULT/worklog/a.md', "'~/vault/worklog/a.md'",
+                           r'\~/vault/worklog/a.md'):
+                command = f'echo "2026-11-11 10:00" >> {target}'
+                with self.subTest(target=target):
+                    self.assertIsNone(hooks.guard_reason(self.bash(command), self.cfg))
+
+    def test_guard_handles_prefixed_copy_move_and_literal_dirname(self):
+        vault = self.h.vault.as_posix()
+        for writer in ('tee', 'cp source', 'mv source'):
+            command = f'sudo -n env X=1 {writer} "{vault}/worklog/a.md" # 2026-11-11 10:00'
+            with self.subTest(writer=writer):
+                self.assertIsNotNone(hooks.guard_reason(self.bash(command), self.cfg))
+        command = f'cd "$(dirname {vault}/x)"; echo "2026-11-11 10:00" >> worklog/a.md'
+        self.assertIsNotNone(hooks.guard_reason(self.bash(command), self.cfg))
+
+    def test_guard_fails_closed_on_unresolved_write_or_cd_substitutions(self):
+        for command in ('echo "2026-11-11 10:00" >> "$(unknown)/worklog/a.md"',
+                        'echo "2026-11-11 10:00" | tee "`unknown`/worklog/a.md"',
+                        'cd "$(unknown)"; echo "2026-11-11 10:00" >> worklog/a.md'):
+            with self.subTest(command=command):
+                self.assertIsNotNone(hooks.guard_reason(self.bash(command), self.cfg))
+        outside = self.h.work.as_posix()
+        command = f'echo "2026-11-11 10:00" >> "{outside}/worklog/a.md"'
+        self.assertIsNone(hooks.guard_reason(self.bash(command), self.cfg))
+
+    def test_guard_comments_start_at_word_boundaries_only(self):
+        target = (self.h.vault / "worklog" / "a.md").as_posix()
+        command = f'echo 2026-11-11\\ 10:00#x >> {target}'
+        self.assertIsNotNone(hooks.guard_reason(self.bash(command), self.cfg))
+        self.assertIsNone(hooks.guard_reason(self.bash(
+            f'echo "2026-11-11 10:00" # comment >> {target}'), self.cfg))
+        self.assertIsNotNone(hooks.guard_reason(self.bash(
+            f'echo "2026-11-11 10:00" >> {target}#suffix'), self.cfg))
+
+    def test_hook_session_lock_wait_is_two_seconds(self):
+        payload, _ = self.session()
+        with mock.patch.object(util, "FileLock") as lock:
+            hooks.Session(payload).lock()
+        self.assertEqual(lock.call_args.kwargs["timeout"], 2)
+        self.assertEqual(lock.call_args.kwargs["stale"], 30)
+
+    def test_session_end_passes_the_two_second_vault_lock_wait(self):
+        payload, _ = self.session()
+        original = util.vault_lock
+        with mock.patch.object(util, "vault_lock", wraps=original) as lock:
+            hooks.session_end(payload)
+        self.assertEqual(lock.call_args_list[0].kwargs.get("timeout"), 2)
+
+    def test_session_end_error_is_displayed_once_at_the_next_session_start(self):
+        payload, _ = self.session()
+        with mock.patch.object(V, "append_worklog", side_effect=OSError("visible end failure")):
+            hooks.session_end(payload)
+        self.assertIn("visible end failure", util.read_text(hooks.hook_errors_log()))
+        next_payload = dict(payload, session_id="next-session", source="startup")
+        with mock.patch.object(jobs, "maybe_schedule_sweep"), mock.patch.object(util, "out") as out:
+            hooks.session_start(next_payload)
+            self.assertIn("visible end failure", str(out.call_args_list))
+            out.reset_mock()
+            hooks.session_start(dict(next_payload, session_id="later-session"))
+            self.assertNotIn("visible end failure", str(out.call_args_list))
+
+    def test_large_note_does_not_hide_small_notes_before_or_after_it(self):
+        big = self.h.vault / "topics" / "Large.md"
+        big.write_text("# Large\n\n" + "unrelated material\n" * 60000, encoding="utf-8")
+        small = self.h.vault / "topics" / "Small.md"
+        small.write_text("# Small\n\nzebrafish unique marker\n", encoding="utf-8")
+        with mock.patch.object(search, "_wanted_files", return_value=iter((big, small))):
+            result = search.search("zebrafish unique marker", root=self.h.vault,
+                                   cfg=self.cfg, budget=search.HOOK_INDEX_BUDGET)
+        self.assertTrue(any(r["path"] == "topics/Small.md" for r in result))
+        con = search.update_index(self.h.vault, self.cfg, budget=search.HOOK_INDEX_BUDGET)
+        self.assertFalse(search.is_complete(con))
+        con.close()
+
+    def test_hook_note_size_cap_is_independent_of_time_left(self):
+        capped = self.h.vault / "topics" / "Capped.md"
+        capped.write_bytes(b"# Capped\n\n" + b"zebrafish " * 55000)
+        con = search.update_index(self.h.vault, self.cfg, budget=search.HOOK_INDEX_BUDGET)
+        try:
+            self.assertEqual(con.execute("SELECT count(*) FROM files WHERE path='topics/Capped.md'")
+                             .fetchone()[0], 0)
+        finally:
+            con.close()
+        self.assertTrue(search.search("zebrafish", root=self.h.vault, cfg=self.cfg))
+
     def test_session_end_with_held_lock_is_fast_and_logs_once(self):
         payload, _ = self.session()
         held = util.FileLock(util.state_dir() / "vault.lock")

@@ -429,9 +429,15 @@ def _abs(p, cwd=None):
     return s.lower() if os.name == "nt" else s
 
 
-def _shell_path(path, cwd):
-    path = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
-                  lambda m: os.environ.get(m.group(1) or m.group(2), m.group(0)), path)
+def _shell_path(path, cwd, env=None):
+    raw = getattr(path, "raw", str(path))
+    path = _expand_word(path, os.environ if env is None else env)
+    if path is None:
+        return None
+    if path.startswith("~") and (raw.startswith("'") or raw.startswith("\\~")):
+        path = "./" + path
+    if cwd is None and not _is_abs(path):
+        return None
     return _abs(path, cwd)
 
 
@@ -443,46 +449,201 @@ _SHELL_BREAKS = set("();|&")
 _WRITE_REDIRECTS = {">", ">>", ">|", "&>", "&>>", ">&"}
 _READ_REDIRECTS = {"<", "<<", "<<<", "<&"}
 _POWERSHELL_WRITERS = {"out-file", "add-content", "set-content"}
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_VARIABLE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+class _ShellWord(str):
+    """Keep source quotes so path expansion and operator tests stay distinct."""
+    def __new__(cls, raw, operator=False):
+        try:
+            value = " ".join(shlex.split(raw, comments=False)) if not operator else raw
+        except ValueError:
+            value = raw
+        word = super().__new__(cls, value)
+        word.raw, word.operator = raw, operator
+        return word
+
+
+def _substitution_end(text, start):
+    """Exclusive end of a substitution, without running any shell code."""
+    backtick = text[start] == "`"
+    i, depth, quote = start + (1 if backtick else 2), 1, None
+    while i < len(text):
+        char = text[i]
+        if char == "\\" and quote != "'":
+            i += 2
+            continue
+        if backtick:
+            if char == "`":
+                return i + 1
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if not depth:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _shell_tokens(cmd):
+    i = 0
+    while i < len(cmd):
+        if cmd[i].isspace() and cmd[i] != "\n":
+            i += 1
+            continue
+        if cmd[i] == "#":
+            end = cmd.find("\n", i)
+            i = len(cmd) if end < 0 else end
+            continue
+        if cmd[i] in "();|&<>\n":
+            end = i + 1
+            if cmd[i] in "|&<>":
+                while end < len(cmd) and cmd[end] in "|&<>":
+                    end += 1
+            yield _ShellWord(cmd[i:end], operator=True)
+            i = end
+            continue
+        start, quote = i, None
+        while i < len(cmd):
+            char = cmd[i]
+            if char == "\\" and quote != "'":
+                i += 2
+                continue
+            if quote != "'" and (cmd.startswith("$(", i) or char == "`"):
+                i = _substitution_end(cmd, i)
+                continue
+            if quote:
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                quote = char
+            elif char.isspace() or char in "();|&<>":
+                break
+            i += 1
+        yield _ShellWord(cmd[start:i])
+
+
+def _expand_word(word, env, depth=0):
+    raw = getattr(word, "raw", str(word))
+    out, i, quote = [], 0, None
+    if depth > 16:
+        return None
+    while i < len(raw):
+        char = raw[i]
+        if char == "\\" and quote != "'" and i + 1 < len(raw):
+            following = raw[i + 1]
+            if quote != '"' or following in '$`"\\\n':
+                out.append(following if following != "\n" else "")
+                i += 2
+                continue
+        if char in "'\"" and (quote is None or quote == char):
+            quote = None if quote else char
+            i += 1
+            continue
+        if quote != "'" and (raw.startswith("$(", i) or char == "`"):
+            end = _substitution_end(raw, i)
+            inner = raw[i + (1 if char == "`" else 2):end - 1]
+            parts = list(_shell_parts(inner))
+            # dirname with one literal argument can be resolved without execution.
+            if len(parts) != 1 or len(parts[0]) != 2 or parts[0][0] != "dirname":
+                return None
+            arg = _expand_word(parts[0][1], env, depth + 1)
+            if arg is None or arg.startswith("-"):
+                return None
+            out.append(posixpath.dirname(arg) or ".")
+            i = end
+            continue
+        if quote != "'" and char == "$":
+            match = _VARIABLE_RE.match(raw, i)
+            if match:
+                value = env.get(match.group(1) or match.group(2), match.group(0))
+                if value is None:
+                    return None
+                out.append(value)
+                i = match.end()
+                continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
 
 def _shell_parts(cmd):
     """Simple command words and subshell boundaries; quoted arguments stay whole."""
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        lex.commenters = "#"
-        toks = list(lex)
-    except ValueError:
-        toks = cmd.split()
     words = []
-    for t in toks:
-        if set(t) <= _SHELL_BREAKS:
+    for t in _shell_tokens(cmd):
+        if t.operator and (set(t) <= _SHELL_BREAKS or t == "\n"):
             yield words
             words = []
             for char in t:
                 if char in "()":
                     yield char
+        elif t.raw in ("{", "}"):
+            continue
         else:
             words.append(t)
     yield words
 
 
+def _command_argv(words):
+    """Strip assignments and execution prefixes, retaining the command word."""
+    argv = list(words)
+    while argv:
+        if _ASSIGNMENT_RE.match(argv[0].raw):
+            argv.pop(0)
+            continue
+        prefix = posixpath.basename(argv[0]).lower()
+        if prefix not in ("sudo", "env", "time", "nohup", "xargs"):
+            break
+        argv.pop(0)
+        takes_value = {"sudo": {"-u", "-g", "-h", "-p", "-C"},
+                       "env": {"-u", "--unset", "-C", "--chdir"},
+                       "xargs": {"-n", "-I", "-L", "-P", "-s", "-d", "-E"}}
+        while argv and argv[0].startswith("-"):
+            option = argv.pop(0)
+            if option == "--":
+                break
+            if option in takes_value.get(prefix, set()) and argv:
+                argv.pop(0)
+    return argv
+
+
+class _WriteTargets(list):
+    unresolved = False
+
+
 def bash_writes(cmd, cwd=None):
     """Resolve shell write targets, with environment expansion and scoped cwd.
     Interpreter one-liners (python -c) remain a documented parsing limit."""
-    out, cur, stack = [], cwd or os.getcwd(), []
+    out, cur, stack = _WriteTargets(), cwd or os.getcwd(), []
+    env = dict(os.environ)
     for words in _shell_parts(cmd):
         if words == "(":
-            stack.append(cur)
+            stack.append((cur, env.copy()))
             continue
         if words == ")":
             if stack:
-                cur = stack.pop()
+                cur, env = stack.pop()
+            continue
+        local_env = env.copy()
+        while words and _ASSIGNMENT_RE.match(words[0].raw):
+            assignment = words.pop(0)
+            key, value = assignment.raw.split("=", 1)
+            expanded = _expand_word(_ShellWord(value), local_env)
+            local_env[key] = expanded
+        if not words:
+            env = local_env
             continue
         argv, targets, i = [], [], 0
         while i < len(words):
             w = words[i]
-            if w in _WRITE_REDIRECTS or w in _READ_REDIRECTS:
+            if w.operator and (w in _WRITE_REDIRECTS or w in _READ_REDIRECTS):
                 if i + 1 < len(words) and w in _WRITE_REDIRECTS and \
                         not (w == ">&" and (words[i + 1].isdigit() or words[i + 1] == "-")):
                     targets.append(words[i + 1])
@@ -490,17 +651,19 @@ def bash_writes(cmd, cwd=None):
                 continue
             argv.append(w)
             i += 1
-        if argv and argv[0] == "sudo":
-            argv = argv[1:]
-            while argv and argv[0].startswith("-"):
-                option = argv.pop(0)
-                if option in ("-u", "-g", "-h", "-p", "-C") and argv:
-                    argv.pop(0)
+        argv = _command_argv(argv)
         name = posixpath.basename(argv[0].replace("\\", "/")).lower() if argv else ""
         args = [a for a in argv[1:] if not a.startswith("-")]
         if name in ("cd", "pushd") and args:
-            out += [_shell_path(t, cur) for t in targets]
-            cur = _shell_path(args[0], cur)
+            for target in targets:
+                resolved = _shell_path(target, cur, local_env)
+                if resolved is None:
+                    out.unresolved = True
+                else:
+                    out.append(resolved)
+            cur = _shell_path(args[0], cur, local_env)
+            if cur is None:
+                out.unresolved = True
             continue
         if name == "tee" or name == "rm":
             targets += args
@@ -512,8 +675,50 @@ def bash_writes(cmd, cwd=None):
             targets += args
         elif name in _POWERSHELL_WRITERS:
             targets += args
-        out += [_shell_path(t, cur) for t in targets]
+        for target in targets:
+            resolved = _shell_path(target, cur, local_env)
+            if resolved is None:
+                out.unresolved = True
+            else:
+                out.append(resolved)
     return out
+
+
+def _mem_writes(cmd, depth=0):
+    if depth > 16:
+        return False
+    for words in _shell_parts(cmd):
+        if not isinstance(words, list) or not words:
+            continue
+        argv = _command_argv(words)
+        if argv:
+            launcher = posixpath.basename(argv[0].replace("\\", "/")).lower()
+            if launcher in ("mem", "mem.cmd") and MEM_WRITE_RE.match(" ".join(argv[1:])):
+                return True
+            if launcher in ("bash", "sh"):
+                for i, arg in enumerate(argv[1:-1], 1):
+                    if arg.startswith("-") and "c" in arg[1:]:
+                        if _mem_writes(argv[i + 1], depth + 1):
+                            return True
+                        break
+        for word in words:
+            raw, i, quote = word.raw, 0, None
+            while i < len(raw):
+                char = raw[i]
+                if char == "\\" and quote != "'":
+                    i += 2
+                    continue
+                if char in "'\"" and (quote is None or quote == char):
+                    quote = None if quote else char
+                elif quote != "'" and (raw.startswith("$(", i) or char == "`"):
+                    end = _substitution_end(raw, i)
+                    inner = raw[i + (1 if char == "`" else 2):end - 1]
+                    if _mem_writes(inner, depth + 1):
+                        return True
+                    i = end
+                    continue
+                i += 1
+    return False
 
 
 def touches_vault(payload, cfg):
@@ -528,13 +733,7 @@ def touches_vault(payload, cfg):
         cmd = ti.get("command") or ""
         if any(_under(t, vroot) for t in bash_writes(cmd, cwd)):
             return True
-        for words in _shell_parts(cmd):
-            if not isinstance(words, list) or not words:
-                continue
-            launcher = posixpath.basename(words[0].replace("\\", "/")).lower()
-            if launcher in ("mem", "mem.cmd") and MEM_WRITE_RE.match(" ".join(words[1:])):
-                return True
-        return False
+        return _mem_writes(cmd)
     return False
 
 
@@ -580,7 +779,10 @@ def guard_reason(payload, cfg):
             return msg
     elif tool == "Bash":
         cmd = ti.get("command") or ""
-        if STAMP_RE.search(cmd) and any(_under(t, wl) for t in bash_writes(cmd, cwd)):
+        targets = bash_writes(cmd, cwd)
+        stamp_text = re.sub(r"\\([ \t])", r"\1", cmd)
+        if STAMP_RE.search(stamp_text) and (any(_under(t, wl) for t in targets) or
+                                          (targets.unresolved and "worklog" in cmd)):
             return msg
     return None
 

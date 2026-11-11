@@ -18,9 +18,11 @@ from . import util, vault as V
 
 SCHEMA = "5"
 # Hooks must answer inside their own timeout (10 s). Indexing a big vault
-# from cold takes longer, so a hook indexes for at most this long, stays
-# silent for that prompt and carries on at the next call.
+# from cold takes longer, so a hook indexes for at most this long and
+# searches the committed sections while later calls continue indexing.
 HOOK_INDEX_BUDGET = 3.0
+# Oversized notes are indexed only by unbudgeted CLI calls.
+HOOK_MAX_NOTE_BYTES = 512 * 1024
 # Not searched: raw logs and machine output. Worklog lines are pointers and
 # daily summaries are distilled copies; both would outrank the real notes.
 EXCLUDE_TOP = {V.WORKLOG, V.DAILY, V.TEMPLATES, V.SWEEPS}
@@ -200,6 +202,9 @@ def update_index(root=None, cfg=None, budget=None):
             r = p.relative_to(root).as_posix()
             seen.add(r)
             st = p.stat()
+            if deadline is not None and st.st_size > HOOK_MAX_NOTE_BYTES:
+                complete = False
+                continue
             trig = _trigger_for(triggers, r, p)
             sig = hashlib.sha256(trig.encode()).hexdigest()[:16]
             if known.get(r) == (st.st_mtime_ns, st.st_size, sig):
@@ -342,9 +347,7 @@ def _best_lines(terms, body_lines, start, n=3):
 
 
 def search(text, k=5, root=None, cfg=None, per_file=2, exclude=(), budget=None):
-    """Best sections for `text`. With a `budget` (hooks), an index that could
-    not be brought up to date inside it gives no answer at all: a partial
-    index would suggest the wrong notes with confidence."""
+    """Best committed sections for `text`, including during budgeted updates."""
     cfg = cfg if cfg is not None else util.load_config(required=False)
     root = Path(root or util.vault_dir(cfg))
     terms = query_terms(text)
@@ -354,8 +357,6 @@ def search(text, k=5, root=None, cfg=None, per_file=2, exclude=(), budget=None):
     stems = {w: stem(w) for _, w in terms} if stem else {}
     con = update_index(root, cfg, budget=budget)
     try:
-        if budget and not is_complete(con):
-            return []
         if fts5_available():
             q = " OR ".join(f'"{t}"*' for t, _ in terms)
             if stems:

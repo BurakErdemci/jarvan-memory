@@ -520,7 +520,7 @@ class IndexBudgetTest(unittest.TestCase):
         self.env.stop()
         self.h.cleanup()
 
-    def test_a_budgeted_update_progresses_stays_silent_and_finishes(self):
+    def test_a_budgeted_update_progresses_searches_committed_rows_and_finishes(self):
         original = search._index_file
 
         def paced(*args, **kwargs):
@@ -536,8 +536,9 @@ class IndexBudgetTest(unittest.TestCase):
         self.assertFalse(search.is_complete(con))
         con.close()
         self.assertTrue(0 < done < 30, done)
-        self.assertEqual(search.search("alpha beta gamma delta", root=self.root, cfg=self.cfg,
-                                       budget=1e-6), [], "a partial index gives no answer")
+        partial = search.search("alpha beta gamma delta", root=self.root, cfg=self.cfg,
+                                budget=1e-6)
+        self.assertTrue(partial, "committed sections remain searchable during indexing")
         for _ in range(60):
             con = search.update_index(self.root, self.cfg, budget=0.03)
             finished = search.is_complete(con)
