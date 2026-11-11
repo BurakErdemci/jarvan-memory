@@ -63,8 +63,10 @@ class Session:
             self.data = None
         if self.data is None and create:
             # A resumed session fires no SessionStart, so any event may be first.
-            self.data = {"start_ts": time.time(),
-                         "start_cwd": self.payload.get("cwd") or os.getcwd(),
+            cwd = self.payload.get("cwd") or os.getcwd()
+            self.data = {"start_ts": time.time(), "start_cwd": cwd,
+                         # Same rule as `mem log`, so both name the project alike.
+                         "project": V.current_project(cwd),
                          "prompts": 0, "wrote_at": -1, "blocked_at": -1, "blocks": 0,
                          "route_seen": [], "recall_seen": []}
         return self.data
@@ -81,7 +83,8 @@ class Session:
     def project(self):
         # The first cwd is the session's identity: the Bash tool's cwd persists
         # across calls, so a later `cd` must not relabel the session.
-        return Path((self.data or {}).get("start_cwd") or os.getcwd()).name or "general"
+        d = self.data or {}
+        return d.get("project") or Path(d.get("start_cwd") or os.getcwd()).name or "general"
 
 
 def scratch_path(sid):
