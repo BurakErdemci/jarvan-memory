@@ -21,6 +21,28 @@ from jarvan_memory.doctor import find_bash  # noqa: E402
 BASH = find_bash()
 
 
+def rmtree(path):
+    """Delete a test tree for real. On Windows git object files are
+    read-only and a just-exited detached job may still hold a log file
+    open, so clear the flag and retry briefly."""
+    import stat
+    import time
+
+    def onerror(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+
+    for _ in range(20):
+        shutil.rmtree(path, onerror=onerror)
+        if not Path(path).exists():
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"test left {path} behind")
+
+
 def _tmp_root():
     # The temp dir must not sit inside a git repository: tests that call
     # `git rev-parse` would find the parent repo and go falsely red.
@@ -46,7 +68,7 @@ class FakeHome:
         self.work.mkdir()
 
     def cleanup(self):
-        shutil.rmtree(self.root, ignore_errors=True)
+        rmtree(self.root)
 
     @property
     def app(self):
