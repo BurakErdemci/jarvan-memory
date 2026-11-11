@@ -1,0 +1,17 @@
+jarvan-memory
+Copyright (c) 2026 jarvan-memory contributors
+Licensed under the MIT License (see LICENSE).
+
+Third-party code
+----------------
+None. jarvan-memory is written from scratch and uses only the Python
+standard library.
+
+Acknowledgements
+----------------
+The optional session-summary module (a detached `claude -p` call that writes
+session summaries into a daily/ folder) follows the general design of
+avenoxbeyin, an MIT-licensed project, Copyright (c) 2026 Avenox. No source
+code from that project is included here; the summary, locking and process
+handling code in jarvan_memory/jobs.py and jarvan_memory/util.py, and the
+Turkish stemmer in jarvan_memory/stem_tr.py, are independent implementations.
