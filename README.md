@@ -110,16 +110,16 @@ geçen notu bulur.
 
 ```sh
 ~/.claude/jarvan-memory/bin/mem uninstall                     # hafıza klasörü kalır
-~/.claude/jarvan-memory/bin/mem uninstall --purge-vault --yes # hafıza klasörünü de siler
 ```
 
 Kaldırma, `settings.json`'a eklenen kancaları, `CLAUDE.md`'deki işaretli bloğu,
 ayar yedeklerini ve çalışma klasörünü siler. Kurulumdan sonra ayarlara başka
 bir şey eklenmediyse `settings.json` ve `CLAUDE.md` bayt bayt eski hâline döner
-(sembolik ya da sabit bağlantı olan dosyalar bağlantılı kalır). `--purge-vault`
-yalnız kurucunun kendi oluşturduğu hafıza klasörünü siler; kurulumdan önce var
-olan bir klasörü, ev klasörünü, bir sürücü kökünü ya da Claude ayar klasörünü
-asla silmez, nedenini söyleyip hiçbir şey kaldırmadan durur.
+(sembolik ya da sabit bağlantı olan dosyalar bağlantılı kalır).
+
+Uninstall always keeps the vault, including older vaults inside the app folder.
+The legacy `--purge-vault` option is refused without changing anything. Remove
+an unwanted vault separately by hand.
 
 ## Belgeler
 

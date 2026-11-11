@@ -68,7 +68,7 @@ class Session:
         util.write_text(self.path, json.dumps(self.data))
 
     def lock(self):
-        return util.FileLock(self.path.with_suffix(".lock"), timeout=3, stale=30)
+        return util.FileLock(self.path.with_suffix(".lock"), timeout=2, stale=30)
 
     @property
     def project(self):
@@ -429,6 +429,12 @@ def _abs(p, cwd=None):
     return s.lower() if os.name == "nt" else s
 
 
+def _shell_path(path, cwd):
+    path = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+                  lambda m: os.environ.get(m.group(1) or m.group(2), m.group(0)), path)
+    return _abs(path, cwd)
+
+
 def _under(path, folder):
     return path == folder or path.startswith(folder + "/")
 
@@ -439,28 +445,40 @@ _READ_REDIRECTS = {"<", "<<", "<<<", "<&"}
 _POWERSHELL_WRITERS = {"out-file", "add-content", "set-content"}
 
 
-def bash_writes(cmd, cwd=None):
-    """Absolute paths a shell command line writes: redirections, tee, the
-    destination of cp, everything mv and rm touch, files of sed -i. Relative
-    paths follow `cd X &&`. Reading (cat, grep) writes nothing. Interpreter
-    one-liners (python -c) are not parsed: a documented limit."""
+def _shell_parts(cmd):
+    """Simple command words and subshell boundaries; quoted arguments stay whole."""
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
-        lex.commenters = ""
+        lex.commenters = "#"
         toks = list(lex)
     except ValueError:
         toks = cmd.split()
-    commands, words = [], []
+    words = []
     for t in toks:
         if set(t) <= _SHELL_BREAKS:
-            commands.append(words)
+            yield words
             words = []
+            for char in t:
+                if char in "()":
+                    yield char
         else:
             words.append(t)
-    commands.append(words)
-    out, cur = [], cwd or os.getcwd()
-    for words in commands:
+    yield words
+
+
+def bash_writes(cmd, cwd=None):
+    """Resolve shell write targets, with environment expansion and scoped cwd.
+    Interpreter one-liners (python -c) remain a documented parsing limit."""
+    out, cur, stack = [], cwd or os.getcwd(), []
+    for words in _shell_parts(cmd):
+        if words == "(":
+            stack.append(cur)
+            continue
+        if words == ")":
+            if stack:
+                cur = stack.pop()
+            continue
         argv, targets, i = [], [], 0
         while i < len(words):
             w = words[i]
@@ -472,10 +490,17 @@ def bash_writes(cmd, cwd=None):
                 continue
             argv.append(w)
             i += 1
+        if argv and argv[0] == "sudo":
+            argv = argv[1:]
+            while argv and argv[0].startswith("-"):
+                option = argv.pop(0)
+                if option in ("-u", "-g", "-h", "-p", "-C") and argv:
+                    argv.pop(0)
         name = posixpath.basename(argv[0].replace("\\", "/")).lower() if argv else ""
         args = [a for a in argv[1:] if not a.startswith("-")]
         if name in ("cd", "pushd") and args:
-            cur = _abs(args[0], cur)
+            out += [_shell_path(t, cur) for t in targets]
+            cur = _shell_path(args[0], cur)
             continue
         if name == "tee" or name == "rm":
             targets += args
@@ -487,7 +512,7 @@ def bash_writes(cmd, cwd=None):
             targets += args
         elif name in _POWERSHELL_WRITERS:
             targets += args
-        out += [_abs(t, cur) for t in targets]
+        out += [_shell_path(t, cur) for t in targets]
     return out
 
 
@@ -503,11 +528,17 @@ def touches_vault(payload, cfg):
         cmd = ti.get("command") or ""
         if any(_under(t, vroot) for t in bash_writes(cmd, cwd)):
             return True
-        return bool(MEM_WRITE_RE.search(cmd))
+        for words in _shell_parts(cmd):
+            if not isinstance(words, list) or not words:
+                continue
+            launcher = posixpath.basename(words[0].replace("\\", "/")).lower()
+            if launcher in ("mem", "mem.cmd") and MEM_WRITE_RE.match(" ".join(words[1:])):
+                return True
+        return False
     return False
 
 
-MEM_WRITE_RE = re.compile(r"(?:^|[\s;&|(\"'/\\])mem(?:\.cmd)?[\"']?\s+(?:log|handoff\s+(?:open|close)|"
+MEM_WRITE_RE = re.compile(r"^(?:log|handoff\s+(?:open|close)|"
                           r"infer\s+(?:observation|claim)|verify|promote|refute|note\s+new|index\s+add)\b")
 
 
@@ -722,19 +753,20 @@ def session_end(payload):
         if data.get("blocks"):
             body += f" · stop-gate: asked {data['blocks']}x"
         try:
-            V.append_worklog("session", sess.project, body)
-        except Exception:
-            pass
-        streak = util.state_dir() / "miss_streak"
-        n = 0 if wrote else _read_int(streak) + 1
-        util.write_text(streak, f"{n}\n")
+            with util.vault_lock(timeout=util.HOOK_VAULT_LOCK_TIMEOUT):
+                V.append_worklog("session", sess.project, body)
+                streak = util.state_dir() / "miss_streak"
+                n = 0 if wrote else _read_int(streak) + 1
+                util.write_text(streak, f"{n}\n")
+        except Exception as e:
+            _log_hook_error("session-end", e)
     from . import jobs
     jobs.on_session_end(cfg, payload, data)
     try:
         sess.path.unlink()
         sess.path.with_suffix(".lock").unlink(missing_ok=True)
-    except OSError:
-        pass
+    except OSError as e:
+        _log_hook_error("session-end", e)
 
 
 # ----------------------------------------------------------------- dispatch

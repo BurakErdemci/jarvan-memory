@@ -248,6 +248,16 @@ def run_summary(cfg, job):
     if not lock.acquire(wait=False):
         return
     try:
+        completed = util.state_dir() / f"summary-{sid}.done"
+        marker = f"<!-- jarvan-memory:summary {sid} -->"
+        vroot = Path(cfg["vault"])
+        if completed.exists():
+            return
+        # The daily entry carries the receipt as well, so a crash between
+        # writing it and saving state cannot produce a duplicate model call.
+        if any(marker in util.read_text(p) for p in (vroot / V.DAILY).glob("*.md")):
+            util.write_text(completed, util.stamp() + "\n")
+            return
         text = transcript_text(tp)
         if len(text) < SUMMARY_MIN_CHARS:
             return  # tiny session: not worth a model call
@@ -257,13 +267,13 @@ def run_summary(cfg, job):
             record_error("summary", out)
             return
         if out.strip() == NOTHING:
+            util.write_text(completed, util.stamp() + "\n")
             record_error("summary", "")
             return
         if not validate_summary(out):
             record_error("summary", "model output did not match the summary schema; nothing written")
             return
         body = re.sub(r"^## ", "### ", out.strip(), flags=re.M)
-        vroot = Path(cfg["vault"])
         path = vroot / V.DAILY / f"{util.today()}.md"
         with util.vault_lock():
             if not path.exists():
@@ -271,8 +281,10 @@ def run_summary(cfg, job):
                     {"title": f"Daily {util.today()}", "created": util.stamp(), "type": "daily"})
                     + f"# {util.today()}\n\nSession summaries written by the summary module. "
                     "Distilled, not verified: check against the source before relying.\n")
-            util.append_text(path, f"\n## Session {util.now().strftime('%H:%M')} · "
-                                   f"{job.get('project', '')}\n\n{body}\n")
+            entry = (f"\n## Session {util.now().strftime('%H:%M')} · "
+                     f"{job.get('project', '')}\n\n{body}\n{marker}\n")
+            util.write_text(path, util.read_text(path) + entry)
+            util.write_text(completed, util.stamp() + "\n")
         record_error("summary", "")
     finally:
         lock.release()

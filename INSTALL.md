@@ -161,8 +161,7 @@ Tell the user, in their language:
 - where the vault is and that it is plain Markdown they can read and edit,
 - that the memory starts working in the **next** Claude Code session (restart it),
 - the one command worth knowing: `<claude config>/jarvan-memory/bin/mem search "<question>"`,
-- how to remove it: `<claude config>/jarvan-memory/bin/mem uninstall` (keeps the vault;
-  `--purge-vault --yes` deletes it too, but only a vault this installer created).
+- how to remove it: `<claude config>/jarvan-memory/bin/mem uninstall` (always keeps the vault).
 
 The full `mem` path is `<claude config>/jarvan-memory/bin/mem` (`mem.cmd` for
 cmd/PowerShell). Agents get it from the session-start block; users who want a
@@ -174,7 +173,8 @@ short `mem` can add `<claude config>/jarvan-memory/bin` to their PATH.
 installer added: our hook entries from `settings.json` (restoring the original
 bytes when nothing else changed since install), the marked CLAUDE.md block,
 the settings backups, and the runtime folder. A `settings.json` or `CLAUDE.md`
-that is a symlink or hard link stays linked. The vault is kept unless the user
-explicitly asks for `--purge-vault --yes`; even then it is deleted only if the
-installer created it (a folder that existed before install is never deleted)
-and it is not the home directory, a drive root or the Claude config folder.
+that is a symlink or hard link stays linked. Uninstall always keeps the vault,
+including vaults inside the app directory from older installs. The legacy
+`--purge-vault` option is refused without changing anything; remove an unwanted
+vault separately by hand. New installs reject vaults inside the Claude config
+directory or the app directory.

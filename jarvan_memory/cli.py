@@ -225,8 +225,8 @@ def build_parser():
     s.set_defaults(fn=cmd_doctor)
 
     s = sub.add_parser("uninstall", help="remove what the installer added (keeps the vault)")
-    s.add_argument("--purge-vault", action="store_true", help="also delete the vault folder")
-    s.add_argument("--yes", action="store_true", help="required with --purge-vault")
+    s.add_argument("--purge-vault", action="store_true", help="legacy option; refused to protect the vault")
+    s.add_argument("--yes", action="store_true", help="legacy purge confirmation (vault is always kept)")
     s.set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("repair-python", help="re-detect the Python interpreter for the hooks")
@@ -253,7 +253,10 @@ def main(argv=None):
     except util.NotInstalled as e:
         util.err(f"mem: {e}")
         return 1
-    except TimeoutError as e:
+    except json.JSONDecodeError as e:
+        util.err(f"mem: invalid JSON in configuration or state: {e}. Repair the file and retry.")
+        return 1
+    except OSError as e:
         util.err(f"mem: {e}")
         return 1
     return rc or 0

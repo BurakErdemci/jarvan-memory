@@ -152,9 +152,15 @@ def write_text(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    created = False
+    try:
+        with open(tmp, "x", encoding="utf-8", newline="\n") as f:
+            created = True
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        if created:
+            tmp.unlink(missing_ok=True)
 
 
 def write_bytes_keep_link(path, data):
@@ -234,6 +240,7 @@ class FileLock:
 
 
 _vault_lock_state = threading.local()
+HOOK_VAULT_LOCK_TIMEOUT = 2.0
 
 
 @contextlib.contextmanager

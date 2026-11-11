@@ -7,6 +7,7 @@ import ast
 import json
 import os
 import re
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -74,11 +75,12 @@ class PurgeTest(PerTestHome):
             self.assertNotEqual(r.returncode, 0, target)
             self.assertTrue(keep.exists(), target)
 
-    def test_a_vault_the_installer_created_is_purged(self):
+    def test_a_vault_the_installer_created_is_kept_even_with_purge(self):
         self.install()
         r = self.h.mem("uninstall", "--purge-vault", "--yes")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertFalse(self.h.vault.exists())
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(self.h.vault.exists())
+        self.assertIn("keeps the vault", r.stderr)
 
     def test_the_home_directory_cannot_be_chosen_as_a_vault(self):
         r = self.install("--vault", str(self.h.home), check=False)
@@ -90,6 +92,8 @@ class PurgeTest(PerTestHome):
 
 class LockTest(HomeTest):
     def test_parallel_index_add_keeps_every_line(self):
+        for i in range(12):
+            (self.h.vault / "topics" / f"N{i}.md").write_text(f"# N{i}\n", encoding="utf-8")
         rcs = parallel(12, lambda i: self.h.mem("index", "add", f"topics/N{i}",
                                                 f"trigger words number {i} alpha").returncode)
         self.assertEqual(rcs, [0] * 12)
@@ -102,14 +106,16 @@ class LockTest(HomeTest):
         text = (self.h.vault / "INDEX.md").read_text(encoding="utf-8")
         self.assertEqual(len(re.findall(r"\[\[topics/Zq\d+x\]\]", text)), 8)
 
-    def test_two_simultaneous_verifies_of_one_claim_have_one_winner(self):
+    def test_two_simultaneous_verifies_of_one_claim_preserve_both_measurements(self):
         self.h.mem("infer", "claim", "race claim", "--scope", "project", "--slug", "rc")
         rcs = parallel(2, lambda i: self.h.mem(
             "verify", "rc", "--evidence", f"worker {i} re-measured the thing independently"
         ).returncode)
         text = (self.h.vault / "inferences" / "rc.md").read_text(encoding="utf-8")
-        self.assertEqual(sorted(rcs), [0, 1])
-        self.assertEqual(text.count("## Verification"), 1)
+        self.assertEqual(rcs, [0, 0])
+        self.assertEqual(text.count("## Verification"), 2)
+        for i in range(2):
+            self.assertIn(f"worker {i} re-measured", text)
 
     def test_a_held_lock_times_out_with_an_error_not_a_silent_skip(self):
         with mock.patch.dict(os.environ, self.h.env):
@@ -515,7 +521,17 @@ class IndexBudgetTest(unittest.TestCase):
         self.h.cleanup()
 
     def test_a_budgeted_update_progresses_stays_silent_and_finishes(self):
-        con = search.update_index(self.root, self.cfg, budget=1e-6)
+        original = search._index_file
+
+        def paced(*args, **kwargs):
+            time.sleep(0.02)
+            return original(*args, **kwargs)
+
+        # Schema setup is measured separately by the timeout regression below.
+        con = search.update_index(self.root, self.cfg, budget=0)
+        con.close()
+        with mock.patch.object(search, "_index_file", side_effect=paced):
+            con = search.update_index(self.root, self.cfg, budget=0.2)
         done = con.execute("SELECT count(*) FROM files").fetchone()[0]
         self.assertFalse(search.is_complete(con))
         con.close()
@@ -523,7 +539,7 @@ class IndexBudgetTest(unittest.TestCase):
         self.assertEqual(search.search("alpha beta gamma delta", root=self.root, cfg=self.cfg,
                                        budget=1e-6), [], "a partial index gives no answer")
         for _ in range(60):
-            con = search.update_index(self.root, self.cfg, budget=1e-6)
+            con = search.update_index(self.root, self.cfg, budget=0.03)
             finished = search.is_complete(con)
             con.close()
             if finished:
@@ -536,6 +552,10 @@ class IndexBudgetTest(unittest.TestCase):
     def test_the_hook_budget_is_well_inside_the_hook_timeout(self):
         self.assertLessEqual(search.HOOK_INDEX_BUDGET, 5)
         self.assertEqual(hooks.ROUTE_MIN_MATCHED, 3)
+        started = time.monotonic()
+        con = search.update_index(self.root, self.cfg, budget=search.HOOK_INDEX_BUDGET)
+        con.close()
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class FenceTest(unittest.TestCase):

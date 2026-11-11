@@ -101,6 +101,10 @@ def check_name(value, what):
     """A single path component typed by the user (slug, file name). It names
     something inside one known folder, so it can never carry a separator."""
     v = (value or "").strip()
+    if len(v) > 120:
+        raise MemError(f"{what} must be at most 120 characters.")
+    if any(marker in v for marker in ("[[", "]]", "#", "|")):
+        raise MemError(f"{what} contains wiki-link syntax that is not allowed in a name.")
     if not v or v in (".", "..") or "/" in v or "\\" in v:
         raise MemError(f"{what} '{value}' must be a plain name, not a path "
                        "(no separators, no '..').")
@@ -250,6 +254,8 @@ def find_handoff(slug, include_closed=False):
 
 def handoff_open(title, slug=None, project=None):
     _check_no_timestamp(title, "title")
+    if slug is not None:
+        check_name(slug, "handoff slug")
     slug = util.slugify(slug or title)
     with util.vault_lock():
         if find_handoff(slug, include_closed=True):
@@ -321,6 +327,8 @@ def infer(kind, title, scope=None, slug=None, text=None, related=None, force=Fal
         raise MemError("a claim needs --scope project (about a system; an agent may "
                        "promote it after fresh verification) or --scope person (about "
                        "the user; only the user may confirm it).")
+    if slug is not None:
+        check_name(slug, "record name")
     slug = util.slugify(slug or title)
     with util.vault_lock():
         p = inference_path(slug)
@@ -358,8 +366,8 @@ def verify(slug, evidence):
     with util.vault_lock():
         p, meta, _ = _load_inference(slug)
         st = meta.get("status")
-        if st != "unverified":
-            raise MemError(f"'{slug}' is {st}; only an unverified claim can be verified")
+        if st not in ("unverified", "verified"):
+            raise MemError(f"'{slug}' is {st}; only an unverified or verified claim can be verified")
         evidence = " ".join((evidence or "").split())
         if len(evidence) < 20:
             raise MemError("--evidence must say what you re-measured and how (at least "
@@ -392,10 +400,10 @@ def resolve_note(target):
 
 
 def has_heading(path, section):
-    want = util.fold(section).strip()
+    want = section.strip().casefold()
     for line in util.read_text(path).splitlines():
         m = re.match(r"^#{1,6}\s+(.*)$", line)
-        if m and want in util.fold(m.group(1)):
+        if m and want == re.sub(r"\s+#+\s*$", "", m.group(1)).strip().casefold():
             return True
     return False
 
@@ -527,6 +535,11 @@ def note_new(folder, name, title=None, trigger=None, force=False, tags=""):
     if not inside(path, vault() / parts[0]):
         raise MemError(f"'{folder}/{name}' resolves outside the vault.")
     with util.vault_lock():
+        for parent in path.parents:
+            if parent == vault():
+                break
+            if parent.exists() and not parent.is_dir():
+                raise MemError(f"{rel(parent)} exists and is not a folder.")
         if path.exists():
             raise MemError(f"{rel(path)} exists: append to it instead")
         if not force:
@@ -550,6 +563,9 @@ def add_index_line(link, trigger):
     idx = vault() / INDEX
     line = f"- [[{link}]] — {' '.join(trigger.split())}\n"
     with util.vault_lock():
+        note = vault() / f"{link}.md"
+        if not note.is_file() or not inside(note, vault()):
+            raise MemError(f"index target '{link}' must be an existing note inside the vault.")
         text = util.read_text(idx) if idx.exists() else "# Index\n\n"
         util.write_text(idx, text.rstrip("\n") + "\n" + line)
     return line.strip()
