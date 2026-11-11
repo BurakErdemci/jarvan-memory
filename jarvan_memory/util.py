@@ -30,6 +30,13 @@ def claude_dir():
 
 
 def app_dir():
+    # An installed runtime lives at <app>/runtime/jarvan_memory/util.py. Trust
+    # that location over the environment: Claude Code may be started without
+    # the CLAUDE_CONFIG_DIR/HOME the installer saw, and the hooks would then
+    # report "not installed" for a perfectly good install.
+    here = Path(__file__).resolve()
+    if here.parents[1].name == "runtime" and (here.parents[2] / "config.json").is_file():
+        return here.parents[2]
     return claude_dir() / APP_NAME
 
 

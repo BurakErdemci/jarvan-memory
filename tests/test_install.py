@@ -28,6 +28,19 @@ class InstallTest(unittest.TestCase):
         return sum(1 for groups in data["hooks"].values() for g in groups
                    for x in g["hooks"] if "jarvan-memory/hook.sh" in x["command"])
 
+    def test_hooks_find_their_install_without_the_install_env(self):
+        # Claude Code can start without the CLAUDE_CONFIG_DIR/HOME the
+        # installer saw; the hook must still find its own config.
+        self.h.install("--modules", "none", "--no-doctor")
+        elsewhere = self.h.root / "other-home"
+        elsewhere.mkdir()
+        self.h.env.pop("CLAUDE_CONFIG_DIR")
+        self.h.env.update({"HOME": str(elsewhere), "USERPROFILE": str(elsewhere)})
+        out = self.h.hook("session-start", {"hook_event_name": "SessionStart", "source": "startup"})
+        text = json.dumps(out)
+        self.assertNotIn("not installed", text)
+        self.assertIn("jarvan-memory", text)
+
     def test_install_twice_is_idempotent(self):
         self.h.install("--modules", "none", "--no-doctor")
         first_settings = self.h.settings.read_text(encoding="utf-8")
