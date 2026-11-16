@@ -197,6 +197,13 @@ target resolves outside. Trade-off: a wrong deny is accepted, but only for a
 command that types both a timestamp and a worklog path; the guard does not chase new
 shell syntax. A wrong old line is for the user to fix by hand.
 
+The guard prevents accidents, not attacks. Its job is to catch an agent that
+types a timestamp by hand; an agent writing to the worklog naturally names the
+file path, and that case is always caught. It is not a security boundary: a
+command built to hide its target (an exported variable, an unlisted
+interpreter) can get past it, and there is nothing to gain by doing so, since
+the vault belongs to the same user.
+
 ## Optional modules
 
 All three run detached from the hook (new session on POSIX; new process group
