@@ -175,16 +175,16 @@ def update_index(root=None, cfg=None, budget=None):
     fts = fts5_available()
     path = db_path(root)
     con = _connect(path)
-    sig = f"{SCHEMA}|fts={int(fts)}|stem={cfg.get('stemmer') or '-'}|{root.resolve()}"
+    index_sig = f"{SCHEMA}|fts={int(fts)}|stem={cfg.get('stemmer') or '-'}|{root.resolve()}"
     _create(con, fts)
     row = con.execute("SELECT value FROM meta WHERE key='sig'").fetchone()
-    if not row or row[0] != sig:
+    if not row or row[0] != index_sig:
         con.close()
         for suffix in ("", "-wal", "-shm"):
             Path(str(path) + suffix).unlink(missing_ok=True)
         con = _connect(path)
         _create(con, fts)
-        con.execute("INSERT OR REPLACE INTO meta VALUES('sig', ?)", (sig,))
+        con.execute("INSERT OR REPLACE INTO meta VALUES('sig', ?)", (index_sig,))
         con.commit()
     triggers = _triggers(root)
     try:
@@ -219,7 +219,6 @@ def update_index(root=None, cfg=None, budget=None):
                 continue
             con.execute("SAVEPOINT index_file")
             try:
-                _drop(con, r, fts)
                 _index_file(con, root, p, r, st, stem, trig, sig, fts, deadline=deadline)
                 _check_budget(deadline)
             except _BudgetSpent:
@@ -350,6 +349,15 @@ def _best_lines(terms, body_lines, start, n=3):
     return [(start + i, line[:200]) for _, i, line in scored[:n]]
 
 
+def _is_fresh(root, path, signature):
+    """True while the note still has the (mtime, size) it was indexed with."""
+    try:
+        st = (root / path).stat()
+    except OSError:
+        return False
+    return signature is not None and tuple(signature) == (st.st_mtime_ns, st.st_size)
+
+
 def search(text, k=5, root=None, cfg=None, per_file=2, exclude=(), budget=None):
     """Best committed sections for `text`, including during budgeted updates."""
     cfg = cfg if cfg is not None else util.load_config(required=False)
@@ -372,11 +380,17 @@ def search(text, k=5, root=None, cfg=None, per_file=2, exclude=(), budget=None):
                 " 6.0, 1.0, 1.0, 4.0) LIMIT 100", (q,)).fetchall()
         else:
             rows = _scan(con, terms, stems)
+        # While another process holds the index write lock update_index could
+        # not refresh anything, so each returned note is checked against its
+        # file here: one stat per distinct path, on every search path.
+        indexed = {p: con.execute("SELECT mtime_ns, size FROM files WHERE path=?", (p,)).fetchone()
+                   for p in {r[1] for r in rows}}
     finally:
         con.close()
+    fresh = {p: _is_fresh(root, p, sig) for p, sig in indexed.items()}
     results = []
     for _id, path, head, s, e, body, status, mtime, bstart, trig, score in rows:
-        if path in exclude:
+        if path in exclude or not fresh[path]:
             continue
         # INDEX trigger text counts toward the match, as AGENT.md promises.
         hit = _matched(terms, stems, head + "\n" + body + "\n" + (trig or ""))

@@ -35,13 +35,13 @@ class TextFirstRuleTest(unittest.TestCase):
     def test_heredoc_with_an_apostrophe_writing_a_timestamp_is_denied(self):
         command = f"cat >> {self.wl}/a.md <<'EOF'\nit's {STAMP} done\nEOF"
         self.assertTrue(self.denied(command))
-        self.assertTrue(self.denied(f"cat <<EOF > {self.outside}/x.md\n{STAMP} worklog\nEOF"))
+        self.assertTrue(self.denied(f"cat <<EOF > {self.outside}/x.md\n{STAMP} worklog/a.md\nEOF"))
 
     def test_opaque_forms_are_denied_only_with_worklog_and_a_timestamp(self):
-        for form in ('echo "{s} worklog" >> "$(echo x).md"', "echo `date` '{s} worklog' > x.md",
-                     "eval 'echo {s} worklog > x'", "bash -c 'echo {s} worklog > x'",
-                     "python3 -c 'print(1)' # {s} worklog", "echo '{s} worklog' | xargs tee",
-                     "env -i tee x # {s} worklog"):
+        for form in ('echo "{s} worklog/a.md" >> "$(echo x).md"', "echo `date` '{s} worklog/a.md' > x.md",
+                     "eval 'echo {s} worklog/a.md > x'", "bash -c 'echo {s} worklog/a.md > x'",
+                     "python3 -c 'print(1)' # {s} worklog/a.md", "echo '{s} worklog/a.md' | xargs tee",
+                     "env -i tee x # {s} worklog/a.md"):
             command = form.format(s=STAMP)
             with self.subTest(command=command):
                 self.assertTrue(self.denied(command))
@@ -67,7 +67,7 @@ class TextFirstRuleTest(unittest.TestCase):
 
     def test_parser_failure_is_denied(self):
         with mock.patch.object(hooks, "bash_writes", side_effect=ValueError("boom")):
-            self.assertTrue(self.denied(f"echo '{STAMP}' > {self.outside}/worklog.md"))
+            self.assertTrue(self.denied(f"echo '{STAMP}' > {self.outside}/worklog/x.md"))
 
     def test_stop_gate_counts_mem_writes_anywhere_in_the_text(self):
         for command in ("sudo mem log x", "if true; then mem log x; fi", "VAR=1 mem log x",

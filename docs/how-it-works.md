@@ -184,14 +184,17 @@ the same file.
 **Worklog guard.** Write, Edit, MultiEdit and NotebookEdit on a file inside
 `<vault>/worklog/` are refused (a relative path is tested against the payload
 `cwd` and against the vault root). A Bash command is looked at only when its
-text holds a `YYYY-MM-DD HH:MM` timestamp *and* the word `worklog`. Then it is
+text holds a `YYYY-MM-DD HH:MM` timestamp *and* a worklog path: a token
+containing `worklog/` or `worklog\`, the vault path itself, or a `cd` followed
+by a bare `worklog` target. Merely mentioning the word is not enough. Then it is
 refused outright when it holds a heredoc (`<<`), `$(`, a backtick, `eval`,
-`xargs`, `env -...` or `bash/sh/python -c`, because those hide the real command
-from any parser. Otherwise the write targets are parsed: the command is refused
+`xargs`, `env -...` or an interpreter or shell (`bash`, `sh`, `pwsh`, `cmd`,
+`python`, `node`, ...) followed by a flag cluster with `c` or `e` (`-c`, `-lc`,
+`-Command`, `/c`), because those hide the real command from any parser. Otherwise the write targets are parsed (`cp -t DIR` and `--target-directory` included): the command is refused
 when a target is inside `<vault>/worklog/` or cannot be resolved (an unset
 variable, a `${X:-y}` expansion), and allowed when there is no target or every
 target resolves outside. Trade-off: a wrong deny is accepted, but only for a
-command that types both a timestamp and "worklog"; the guard does not chase new
+command that types both a timestamp and a worklog path; the guard does not chase new
 shell syntax. A wrong old line is for the user to fix by hand.
 
 ## Optional modules
