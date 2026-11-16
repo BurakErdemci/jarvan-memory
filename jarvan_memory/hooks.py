@@ -748,11 +748,13 @@ STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
 # opaque. The flag cluster is checked by lookahead, not by a backtracking
 # `[A-Za-z]*c[A-Za-z]*`: linear time on a long line.
 _END = r"(?=[\s\"']|$)"
-_FLAGS = r"(?:\.exe)?[\"']?(?:\s+-[A-Za-z-]+(?=\s))*\s+"
+# The interpreter word may not sit inside a token (`-sh`) and at most 8 flag
+# tokens may precede the exec flag: both keep `bash -sh -sh -sh ...` linear.
+_FLAGS = r"(?:\.exe)?[\"']?(?:\s+-[A-Za-z-]+(?=\s)){0,8}\s+"
 
 
 def _exec_flag(names, letters):
-    return (r"|\b(?:" + names + r")" + _FLAGS +
+    return (r"|(?<![\w-])(?:" + names + r")" + _FLAGS +
             r"-(?=[A-Za-z]*[" + letters + r"])[A-Za-z]+" + _END)
 
 
@@ -761,10 +763,10 @@ _OPAQUE_SHELL_RE = re.compile(
     + _exec_flag(r"bash|sh|dash|zsh|ksh|fish|python[\d.]*", "c")
     + _exec_flag(r"node|perl|ruby", "e")
     + _exec_flag(r"php", "er")
-    + r"|\b(?:pwsh|powershell)" + _FLAGS + r"-(?:c|command|encodedcommand)" + _END
+    + r"|(?<![\w-])(?:pwsh|powershell)" + _FLAGS + r"-(?:c|command|encodedcommand)" + _END
     + r"|\bcmd(?:\.exe)?[\"']?\s+(?:/[ds]\s+)*/[ck]" + _END, re.I)
 # `worklog` as a path component: a separator on either side.
-_WORKLOG_DIR_RE = re.compile(r"(?:(?<=[/\\])|(?<=[/\\][\"']))worklog(?![\w.-])|worklog[\"']?(?=[/\\])", re.I)
+_WORKLOG_DIR_RE = re.compile(r"(?:(?<=[/\\])|(?<=[/\\][\"']))worklog(?![\w-]|\.\w)|worklog[\"']?(?=[/\\])", re.I)
 # A bare `worklog` is a target when it follows cd/pushd, a redirect, tee, cp or mv.
 _WORKLOG_BARE_RE = re.compile(
     r"(?:\b(?:cd|pushd)\s+(?:-[\w-]*\s+)*|>>?\s*|\btee\s+(?:-[\w-]*\s+)*|(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:cp|mv)\s+(?:[^;&|\n]*[\s=])?)"

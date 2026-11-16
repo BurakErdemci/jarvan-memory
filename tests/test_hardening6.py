@@ -32,6 +32,7 @@ CASES = [
     ("deny_cp_target_directory_equals", "cd {V} && cp --target-directory=worklog notes.md  # {S}", True),
     ("deny_perl_in_place", "perl -pi -e 's/a/{S}/' {V}/worklog/a.md", True),
     ("deny_python_flag_before_c", "python -u -c \"open('{V}/worklog/a.md','a').write('{S}')\"", True),
+    ("allow_worklog_md_file", "echo '{S}' >> {V}/topics/worklog.md", False),
     ("allow_worklogs_sibling_dir", "bash -c \"ls ~/worklogs {S}\"", False),
     ("allow_worklog_backup_dir", "python -c \"print(1)\"  # ~/worklog-backup {S}", False),
     ("allow_bash_script_path", "bash /scripts/x.sh  # worklog/a.md {S}", False),
@@ -91,6 +92,12 @@ class OpaqueFlagRegexTest(unittest.TestCase):
         command = f"echo {S} worklog/a.md " + "a" * 90000
         started = time.time()
         hooks._names_worklog_path(command)
+        hooks._OPAQUE_SHELL_RE.search(command)
+        self.assertLess(time.time() - started, 0.5)
+
+    def test_repeated_interpreter_like_flags_are_linear(self):
+        command = "bash " + "-sh " * 20000 + f"x worklog/a.md {S}"
+        started = time.time()
         hooks._OPAQUE_SHELL_RE.search(command)
         self.assertLess(time.time() - started, 0.5)
 
