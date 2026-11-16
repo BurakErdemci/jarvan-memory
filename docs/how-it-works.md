@@ -171,21 +171,28 @@ enough and that invented records are noise. `stop_hook_active` turns are
 never blocked, so the gate cannot loop; the block is recorded only after the
 reply was printed. The gate re-arms after another full stretch.
 
-A "memory write" is a Write/Edit inside the vault, or a Bash command that
-writes there (a `>`/`>>` redirect, `tee`, the target of `cp`, `mv` or `rm`,
-`sed -i`) or runs a writing `mem` subcommand. Reading (`cat`, `grep`) and
-`mem search` do not count. On Windows `/c/...` and `C:\...` name the same file.
+A "memory write" is a Write/Edit inside the vault, a Bash command whose
+parsed write target (a `>`/`>>` redirect, `tee`, the target of `cp`, `mv` or
+`rm`, `sed -i`) is inside the vault, or any command whose raw text holds the
+`mem` launcher followed by a writing subcommand. The text rule is deliberate:
+it is not a shell parser, so `echo "mem log x"` or a heredoc mentioning
+`mem log` also counts. Trade-off: the gate errs toward counting a write, and
+the only cost of a wrong count is one skipped reminder. Reading (`cat`,
+`grep`) and `mem search` do not count. On Windows `/c/...` and `C:\...` name
+the same file.
 
 **Worklog guard.** Write, Edit, MultiEdit and NotebookEdit on a file inside
 `<vault>/worklog/` are refused (a relative path is tested against the payload
-`cwd` and against the vault root). A Bash command is refused when it types a
-`YYYY-MM-DD HH:MM` timestamp *and* one of its write targets (a redirect, `tee`,
-the destination of `cp`/`mv`, a `sed -i` file) resolves inside
-`<vault>/worklog/`; relative targets are resolved against the payload `cwd`,
-following a leading `cd X &&`. Commands that only mention a worklog path, or
-write to a `worklog` folder of another project, are not touched. Limit:
-interpreter one-liners (`python -c "open(...).write(...)"`) are not parsed, so
-they are not guarded. A wrong old line is for the user to fix by hand.
+`cwd` and against the vault root). A Bash command is looked at only when its
+text holds a `YYYY-MM-DD HH:MM` timestamp *and* the word `worklog`. Then it is
+refused outright when it holds a heredoc (`<<`), `$(`, a backtick, `eval`,
+`xargs`, `env -...` or `bash/sh/python -c`, because those hide the real command
+from any parser. Otherwise the write targets are parsed: the command is refused
+when a target is inside `<vault>/worklog/` or cannot be resolved (an unset
+variable, a `${X:-y}` expansion), and allowed when there is no target or every
+target resolves outside. Trade-off: a wrong deny is accepted, but only for a
+command that types both a timestamp and "worklog"; the guard does not chase new
+shell syntax. A wrong old line is for the user to fix by hand.
 
 ## Optional modules
 

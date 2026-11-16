@@ -563,12 +563,14 @@ def _expand_word(word, env, depth=0):
         if quote != "'" and char == "$":
             match = _VARIABLE_RE.match(raw, i)
             if match:
-                value = env.get(match.group(1) or match.group(2), match.group(0))
+                value = env.get(match.group(1) or match.group(2))
                 if value is None:
                     return None
                 out.append(value)
                 i = match.end()
                 continue
+            if i + 1 < len(raw) and not raw[i + 1].isspace() and raw[i + 1] not in "'\"":
+                return None  # ${VAR:-x}, $?, $1 ...: no way to know the value
         out.append(char)
         i += 1
     return "".join(out)
@@ -640,6 +642,8 @@ def bash_writes(cmd, cwd=None):
         if not words:
             env = local_env
             continue
+        # A prefix assignment is for the command's environment only: the shell
+        # expands this command's redirections and arguments without it.
         argv, targets, i = [], [], 0
         while i < len(words):
             w = words[i]
@@ -656,12 +660,12 @@ def bash_writes(cmd, cwd=None):
         args = [a for a in argv[1:] if not a.startswith("-")]
         if name in ("cd", "pushd") and args:
             for target in targets:
-                resolved = _shell_path(target, cur, local_env)
+                resolved = _shell_path(target, cur, env)
                 if resolved is None:
                     out.unresolved = True
                 else:
                     out.append(resolved)
-            cur = _shell_path(args[0], cur, local_env)
+            cur = _shell_path(args[0], cur, env)
             if cur is None:
                 out.unresolved = True
             continue
@@ -676,49 +680,12 @@ def bash_writes(cmd, cwd=None):
         elif name in _POWERSHELL_WRITERS:
             targets += args
         for target in targets:
-            resolved = _shell_path(target, cur, local_env)
+            resolved = _shell_path(target, cur, env)
             if resolved is None:
                 out.unresolved = True
             else:
                 out.append(resolved)
     return out
-
-
-def _mem_writes(cmd, depth=0):
-    if depth > 16:
-        return False
-    for words in _shell_parts(cmd):
-        if not isinstance(words, list) or not words:
-            continue
-        argv = _command_argv(words)
-        if argv:
-            launcher = posixpath.basename(argv[0].replace("\\", "/")).lower()
-            if launcher in ("mem", "mem.cmd") and MEM_WRITE_RE.match(" ".join(argv[1:])):
-                return True
-            if launcher in ("bash", "sh"):
-                for i, arg in enumerate(argv[1:-1], 1):
-                    if arg.startswith("-") and "c" in arg[1:]:
-                        if _mem_writes(argv[i + 1], depth + 1):
-                            return True
-                        break
-        for word in words:
-            raw, i, quote = word.raw, 0, None
-            while i < len(raw):
-                char = raw[i]
-                if char == "\\" and quote != "'":
-                    i += 2
-                    continue
-                if char in "'\"" and (quote is None or quote == char):
-                    quote = None if quote else char
-                elif quote != "'" and (raw.startswith("$(", i) or char == "`"):
-                    end = _substitution_end(raw, i)
-                    inner = raw[i + (1 if char == "`" else 2):end - 1]
-                    if _mem_writes(inner, depth + 1):
-                        return True
-                    i = end
-                    continue
-                i += 1
-    return False
 
 
 def touches_vault(payload, cfg):
@@ -731,14 +698,19 @@ def touches_vault(payload, cfg):
         return bool(fp) and _under(_abs(fp, cwd), vroot)
     if tool == "Bash":
         cmd = ti.get("command") or ""
-        if any(_under(t, vroot) for t in bash_writes(cmd, cwd)):
-            return True
-        return _mem_writes(cmd)
+        try:
+            if any(_under(t, vroot) for t in bash_writes(cmd, cwd)):
+                return True
+        except Exception:
+            pass
+        # Text first, may over-count: a skipped reminder is the only cost.
+        launcher = r"(?:mem(?:\.cmd)?|" + re.escape(mem_cmd(cfg)) + r")"
+        return bool(re.search(r"(?<![\w.-])[\"']?" + launcher + r"[\"']?\s+" + MEM_WRITE_BODY, cmd, re.I))
     return False
 
 
-MEM_WRITE_RE = re.compile(r"^(?:log|handoff\s+(?:open|close)|"
-                          r"infer\s+(?:observation|claim)|verify|promote|refute|note\s+new|index\s+add)\b")
+MEM_WRITE_BODY = (r"(?:log|handoff\s+(?:open|close)|"
+                  r"infer\s+(?:observation|claim)|verify|promote|refute|note\s+new|index\s+add)\b")
 
 
 def post_tool(payload):
@@ -756,6 +728,9 @@ def post_tool(payload):
 # ----------------------------------------------------------------- PreToolUse
 
 STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
+_OPAQUE_SHELL_RE = re.compile(
+    r"<<|\$\(|`|\beval\b|\bxargs\b|\benv\s+-"
+    r"|\b(?:bash|sh|zsh|python3?|node|perl|ruby)\b.*\s-c\s", re.I)
 
 
 def guard_reason(payload, cfg):
@@ -779,10 +754,19 @@ def guard_reason(payload, cfg):
             return msg
     elif tool == "Bash":
         cmd = ti.get("command") or ""
-        targets = bash_writes(cmd, cwd)
         stamp_text = re.sub(r"\\([ \t])", r"\1", cmd)
-        if STAMP_RE.search(stamp_text) and (any(_under(t, wl) for t in targets) or
-                                          (targets.unresolved and "worklog" in cmd)):
+        if not STAMP_RE.search(stamp_text) or "worklog" not in cmd.lower():
+            return None
+        # Text first: shell syntax is not chased. Forms that hide the real
+        # command from a parser are refused outright; a wrong deny needs both
+        # "worklog" and a typed timestamp in the same command.
+        if _OPAQUE_SHELL_RE.search(cmd):
+            return msg
+        try:
+            targets = bash_writes(cmd, cwd)
+        except Exception:
+            return msg
+        if targets.unresolved or any(_under(t, wl) for t in targets):
             return msg
     return None
 

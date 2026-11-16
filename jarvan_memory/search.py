@@ -193,20 +193,28 @@ def update_index(root=None, cfg=None, budget=None):
         return con
     try:
         known = {r[0]: (r[1], r[2], r[3]) for r in con.execute("SELECT * FROM files")}
-        seen = set()
-        complete = True
+        # Before any budgeted work: a stat per file, no content read. Rows of
+        # deleted or changed notes go now, so a deferred re-index (budget or
+        # size cap) can never serve the old text or status.
+        current = {}
         for p in _wanted_files(root):
+            r = p.relative_to(root).as_posix()
+            st = p.stat()
+            trig = _trigger_for(triggers, r, p)
+            current[r] = (p, st, trig, hashlib.sha256(trig.encode()).hexdigest()[:16])
+        for r, old in known.items():
+            now = current.get(r)
+            if now is None or old != (now[1].st_mtime_ns, now[1].st_size, now[3]):
+                _drop(con, r, fts)
+                con.execute("DELETE FROM files WHERE path=?", (r,))
+        complete = True
+        for r, (p, st, trig, sig) in current.items():
             if deadline is not None and time.monotonic() >= deadline:
                 complete = False
                 break
-            r = p.relative_to(root).as_posix()
-            seen.add(r)
-            st = p.stat()
             if deadline is not None and st.st_size > HOOK_MAX_NOTE_BYTES:
                 complete = False
                 continue
-            trig = _trigger_for(triggers, r, p)
-            sig = hashlib.sha256(trig.encode()).hexdigest()[:16]
             if known.get(r) == (st.st_mtime_ns, st.st_size, sig):
                 continue
             con.execute("SAVEPOINT index_file")
@@ -219,10 +227,6 @@ def update_index(root=None, cfg=None, budget=None):
                 complete = False
             finally:
                 con.execute("RELEASE index_file")
-        if complete:
-            for r in set(known) - seen:
-                _drop(con, r, fts)
-                con.execute("DELETE FROM files WHERE path=?", (r,))
         con.execute("INSERT OR REPLACE INTO meta VALUES('complete', ?)", (str(int(complete)),))
         con.commit()
     except Exception:

@@ -626,7 +626,7 @@ class DocsTest(unittest.TestCase):
 
     def test_the_guard_scope_is_documented_with_its_limit(self):
         text = self.read("docs/how-it-works.md")
-        self.assertIn("interpreter one-liners", text)
+        self.assertIn("does not chase new", text)
         self.assertIn("cwd", text)
         self.assertIn("Edit, MultiEdit", text)
 
