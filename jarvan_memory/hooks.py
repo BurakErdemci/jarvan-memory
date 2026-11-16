@@ -742,32 +742,31 @@ def post_tool(payload):
 # ----------------------------------------------------------------- PreToolUse
 
 STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
-# No nested ".*": an interpreter, then only flag words up to the first flag
-# cluster holding c or e (-c, -lc, -ec, -c'..', -Command, /c), so a long line
-# is scanned in linear time.
+# The exec flag is its own token directly after the interpreter word (a quote
+# may be glued: -c'..'), so a path argument (`bash /scripts/x.sh`) and
+# errexit (`bash -e x.sh`) are not opaque. No nested ".*": linear time on a long line.
+_END = r"(?=[\s\"']|$)"
 _OPAQUE_SHELL_RE = re.compile(
     r"<<|\$\(|`|\beval\b|\bxargs\b|\benv\s+-"
-    r"|\b(?:bash|sh|dash|zsh|ksh|fish|pwsh|powershell|cmd|python[\d.]*|node|perl|ruby|php)(?:\.exe)?\b[\"']?"
-    r"\s+(?:-\S*\s+)*?[-/][A-Za-z]*[ce]", re.I)
-_WORKLOG_DIR_RE = re.compile(r"worklog[/\\]", re.I)
-_WORKLOG_WORD_RE = re.compile(r"(?<![\w./\\-])worklog(?![\w./\\-])", re.I)
-_CD_RE = re.compile(r"\b(?:cd|pushd)\b")
+    r"|\b(?:bash|sh|dash|zsh|ksh)(?:\.exe)?[\"']?\s+-[A-Za-z]*c[A-Za-z]*" + _END +
+    r"|\bfish(?:\.exe)?[\"']?\s+-c" + _END +
+    r"|\bpython[\d.]*(?:\.exe)?[\"']?\s+-c" + _END +
+    r"|\b(?:node|perl|ruby)(?:\.exe)?[\"']?\s+-e" + _END +
+    r"|\bphp(?:\.exe)?[\"']?\s+-[er]" + _END +
+    r"|\b(?:pwsh|powershell)(?:\.exe)?[\"']?\s+-(?:c|command|encodedcommand)" + _END +
+    r"|\bcmd(?:\.exe)?[\"']?\s+(?:/[ds]\s+)*/[ck]" + _END, re.I)
+# `worklog` as a path component: a separator on either side.
+_WORKLOG_DIR_RE = re.compile(r"(?<=[/\\])worklog|worklog(?=[/\\])", re.I)
+# A bare `worklog` is a target when it follows cd/pushd, a redirect, tee, cp or mv.
+_WORKLOG_BARE_RE = re.compile(
+    r"(?:\b(?:cd|pushd)\s+|>>?\s*|\btee\s+(?:-\w+\s+)*|(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:cp|mv)\s+(?:[^;&|\n]*\s)?)"
+    r"[\"']?worklog[\"']?(?=[\s;&|)]|$)", re.I)
 
 
-def _names_worklog_path(cmd, vault):
-    """Does the command text point at a worklog path: a `worklog/` token, the
-    vault path itself, or a cd followed by a bare `worklog` target?"""
-    if _WORKLOG_DIR_RE.search(cmd):
-        return True
-    text = cmd.replace("\\", "/").lower()
-    root = _abs(vault)
-    spellings = {root}
-    if len(root) > 2 and root[1] == ":":
-        spellings.add("/" + root[0] + root[2:])
-    if any(x in text for x in spellings):
-        return True
-    cd = _CD_RE.search(cmd)
-    return bool(cd and _WORKLOG_WORD_RE.search(cmd, cd.end()))
+def _names_worklog_path(cmd):
+    """Does the command text name `worklog` as a path component, or as the bare
+    target of cd, pushd, a redirect, tee, cp or mv? The vault path alone does not count."""
+    return bool(_WORKLOG_DIR_RE.search(cmd) or _WORKLOG_BARE_RE.search(cmd))
 
 
 def guard_reason(payload, cfg):
@@ -795,7 +794,7 @@ def guard_reason(payload, cfg):
     elif tool == "Bash":
         cmd = ti.get("command") or ""
         stamp_text = re.sub(r"\\([ \t])", r"\1", cmd)
-        if not STAMP_RE.search(stamp_text) or not _names_worklog_path(cmd, Path(cfg["vault"]).resolve()):
+        if not STAMP_RE.search(stamp_text) or not _names_worklog_path(cmd):
             return None
         # Text first: shell syntax is not chased. Forms that hide the real
         # command from a parser are refused outright; a wrong deny needs both

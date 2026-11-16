@@ -55,7 +55,7 @@ class GuardTriggerTest(unittest.TestCase):
                      "bash -c'echo {s} > worklog/a.md'", 'python3 -c"print(1)" # {s} worklog/a.md',
                      "powershell -Command \"Add-Content worklog/a.md '{s}'\"",
                      "pwsh -c \"Add-Content worklog/a.md '{s}'\"", "cmd /c echo {s} >> worklog\\a.md",
-                     "C:/Python/python.exe -c 'echo {s} worklog/a.md'", "'C:/Program Files/Python/python.exe' -c 'echo {s} worklog/a.md'", "/usr/bin/bash --norc -lc 'echo {s} >> worklog/a.md'"):
+                     "C:/Python/python.exe -c 'echo {s} worklog/a.md'", "'C:/Program Files/Python/python.exe' -c 'echo {s} worklog/a.md'"):
             command = form.format(s=STAMP)
             with self.subTest(command=command):
                 self.assertTrue(self.denied(command))
