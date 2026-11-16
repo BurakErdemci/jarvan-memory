@@ -742,24 +742,32 @@ def post_tool(payload):
 # ----------------------------------------------------------------- PreToolUse
 
 STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}")
-# The exec flag is its own token directly after the interpreter word (a quote
-# may be glued: -c'..'), so a path argument (`bash /scripts/x.sh`) and
-# errexit (`bash -e x.sh`) are not opaque. No nested ".*": linear time on a long line.
+# The exec flag is its own token after the interpreter word, after any other
+# flag tokens (`perl -pi -e`, `bash --login -c`); a quote may be glued: -c'..'.
+# A path argument (`bash /scripts/x.sh`) and errexit (`bash -e x.sh`) are not
+# opaque. The flag cluster is checked by lookahead, not by a backtracking
+# `[A-Za-z]*c[A-Za-z]*`: linear time on a long line.
 _END = r"(?=[\s\"']|$)"
+_FLAGS = r"(?:\.exe)?[\"']?(?:\s+-[A-Za-z-]+(?=\s))*\s+"
+
+
+def _exec_flag(names, letters):
+    return (r"|\b(?:" + names + r")" + _FLAGS +
+            r"-(?=[A-Za-z]*[" + letters + r"])[A-Za-z]+" + _END)
+
+
 _OPAQUE_SHELL_RE = re.compile(
     r"<<|\$\(|`|\beval\b|\bxargs\b|\benv\s+-"
-    r"|\b(?:bash|sh|dash|zsh|ksh)(?:\.exe)?[\"']?\s+-[A-Za-z]*c[A-Za-z]*" + _END +
-    r"|\bfish(?:\.exe)?[\"']?\s+-c" + _END +
-    r"|\bpython[\d.]*(?:\.exe)?[\"']?\s+-c" + _END +
-    r"|\b(?:node|perl|ruby)(?:\.exe)?[\"']?\s+-e" + _END +
-    r"|\bphp(?:\.exe)?[\"']?\s+-[er]" + _END +
-    r"|\b(?:pwsh|powershell)(?:\.exe)?[\"']?\s+-(?:c|command|encodedcommand)" + _END +
-    r"|\bcmd(?:\.exe)?[\"']?\s+(?:/[ds]\s+)*/[ck]" + _END, re.I)
+    + _exec_flag(r"bash|sh|dash|zsh|ksh|fish|python[\d.]*", "c")
+    + _exec_flag(r"node|perl|ruby", "e")
+    + _exec_flag(r"php", "er")
+    + r"|\b(?:pwsh|powershell)" + _FLAGS + r"-(?:c|command|encodedcommand)" + _END
+    + r"|\bcmd(?:\.exe)?[\"']?\s+(?:/[ds]\s+)*/[ck]" + _END, re.I)
 # `worklog` as a path component: a separator on either side.
-_WORKLOG_DIR_RE = re.compile(r"(?<=[/\\])worklog|worklog(?=[/\\])", re.I)
+_WORKLOG_DIR_RE = re.compile(r"(?:(?<=[/\\])|(?<=[/\\][\"']))worklog(?![\w.-])|worklog[\"']?(?=[/\\])", re.I)
 # A bare `worklog` is a target when it follows cd/pushd, a redirect, tee, cp or mv.
 _WORKLOG_BARE_RE = re.compile(
-    r"(?:\b(?:cd|pushd)\s+|>>?\s*|\btee\s+(?:-\w+\s+)*|(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:cp|mv)\s+(?:[^;&|\n]*\s)?)"
+    r"(?:\b(?:cd|pushd)\s+(?:-[\w-]*\s+)*|>>?\s*|\btee\s+(?:-[\w-]*\s+)*|(?:^|[;&|(\n])\s*(?:sudo\s+)?(?:cp|mv)\s+(?:[^;&|\n]*[\s=])?)"
     r"[\"']?worklog[\"']?(?=[\s;&|)]|$)", re.I)
 
 

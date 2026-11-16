@@ -189,11 +189,12 @@ text holds a `YYYY-MM-DD HH:MM` timestamp *and* `worklog` as a path component
 `worklog/a.md`), or a bare `worklog` as the target of `cd`, `pushd`, `>`, `>>`,
 `tee`, `cp` or `mv`. The vault path alone does not count, and neither does the word
 on its own. Then it is refused outright when it holds a heredoc (`<<`), `$(`, a
-backtick, `eval`, `xargs`, `env -...` or an interpreter followed directly by its exec
-flag as a separate token (`bash -c`/`-lc`, `python -c`, `node -e`, `php -r`,
-`pwsh -Command`, `cmd /c`); a path argument such as `bash /scripts/x.sh` or
-`bash -e deploy.sh` is not an exec flag. Those forms hide the real command from any
-parser. Otherwise the write targets are parsed (`cp -t DIR` and `--target-directory` included): the command is refused
+backtick, `eval`, `xargs`, `env -...` or an interpreter whose exec flag is a
+separate token, after any other flag tokens (`bash -c`/`-lc`, `bash --login -c`,
+`python -u -c`, `perl -pi -e`, `node -e`, `php -r`, `pwsh -NoProfile -Command`,
+`cmd /c`); a path argument such as `bash /scripts/x.sh` or `bash -e deploy.sh` is
+not an exec flag. Those forms hide the real command from any parser. Otherwise
+the write targets are parsed (`cp -t DIR` and `--target-directory=DIR` included): the command is refused
 when a target is inside `<vault>/worklog/` or cannot be resolved (an unset
 variable, a `${X:-y}` expansion), and allowed when there is no target or every
 target resolves outside. Trade-off: a wrong deny is accepted, but only for a
